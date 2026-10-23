@@ -95,6 +95,8 @@ def _loopback_devices() -> list[AudioDevice]:
 
 
 class AudioSource(Source):
+    sample_dtype = np.float32
+
     def __init__(self, device: AudioDevice, sample_rate: float | None = None,
                  channels: int | None = None, blocksize: int = 0) -> None:
         super().__init__()

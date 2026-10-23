@@ -9,8 +9,8 @@ from typing import Callable, Protocol
 
 import numpy as np
 
-from aquafonix.screen.extract import (ScrollStitcher, TraceResult, TraceSettings,
-                                      extract_trace, probe_value)
+from aquafonix.screen.extract import (FrameTraces, ScrollStitcher, TraceSettings,
+                                      extract_traces, probe_value)
 from aquafonix.sources.base import Source
 
 OUTPUTS = {
@@ -86,7 +86,7 @@ def monitor_rects() -> list[tuple[int, int, int, int]]:
 @dataclass
 class Frame:
     image: np.ndarray
-    result: TraceResult
+    result: FrameTraces
     t: float
     region: Region
 
@@ -109,7 +109,6 @@ class ScreenSource(Source):
         self.output = output
         self.probe = probe
         self.probe_column = probe_column
-        self.channel_name = "screen"
         self.buffer_capacity = 200_000
         self.latest: Frame | None = None
         self.frames = 0
@@ -145,19 +144,22 @@ class ScreenSource(Source):
         region, settings, output = self.region, self.settings, self.output
         image = self._grabber.grab(region)
         t = self.now()
-        result = extract_trace(image, settings)
+        result = extract_traces(image, settings)
         self.latest = Frame(image, result, t, region)
+        names = result.names
         if output == "stitch":
-            key = (region, settings.calibration)
+            key = (region, settings.calibration, tuple(names))
             if key != self._stitch_key:
                 self.stitcher.reset()
                 self._stitch_key = key
-            times, values = self.stitcher.update(result.y_px, result.y, t)
-            if len(times):
-                self.push(times, values, [self.channel_name])
-        else:
-            self.push([t], [probe_value(result.y, self.probe, self.probe_column)],
-                      [self.channel_name])
+            ref = result.reference()
+            if ref is not None:
+                times, values = self.stitcher.update(ref.y_px, result.y, t)
+                if len(times):
+                    self.push(times, values, names)
+        elif names:
+            values = [probe_value(tr.y, self.probe, self.probe_column) for tr in result.traces]
+            self.push([t], [values], names)
         self.frames += 1
         elapsed = time.perf_counter() - started
         period = 1.0 / max(self.fps, 0.1)

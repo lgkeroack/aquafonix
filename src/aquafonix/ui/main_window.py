@@ -1,4 +1,5 @@
-"""The main window: source selection, live plots, recording and export."""
+"""The main window: sources, live and explorable plots, acoustics, the
+identify / confirm / correct loop, event capture, replay and recording."""
 
 from __future__ import annotations
 
@@ -8,25 +9,46 @@ import time
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QSettings, Qt, QTimer
-from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
-                               QScrollArea, QSplitter, QStackedWidget, QVBoxLayout, QWidget)
+from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDockWidget, QFileDialog, QFormLayout,
+                               QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
+                               QPushButton, QScrollArea, QSlider, QSplitter, QStackedWidget,
+                               QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
 from aquafonix import APP_NAME, __version__
+from aquafonix.acoustics.analyzer import Analyzer, Detection
+from aquafonix.acoustics.filters import denoise, filter_clip
+from aquafonix.acoustics.signatures import Matcher, SignatureLibrary, estimate_band
 from aquafonix.buffer import RingBuffer
-from aquafonix.dsp import estimate_rate, find_trigger, minmax_decimate, spectrum
+from aquafonix.dsp import find_trigger, minmax_decimate
+from aquafonix.events import EventStore
+from aquafonix.player import SPEEDS, Player
 from aquafonix.recorder import CsvRecorder, WavRecorder
 from aquafonix.screen.capture import Region, ScreenSource
+from aquafonix.screen.extract import auto_trace_colors
 from aquafonix.screen.overlay import RegionOutline, RegionSelector
 from aquafonix.sources import Source
-from aquafonix.ui.panels import PANELS, ScreenPanel, SourcePanel
-from aquafonix.ui.plots import PreviewView, SpectrumPlot, TimePlot, channel_color
+from aquafonix.sources.audiofile import AudioFileSource
+from aquafonix.ui.acoustics_panel import AcousticsPanel
+from aquafonix.ui.dialogs import IdentifyDialog, SignatureManager, ask_label
+from aquafonix.ui.panels import PANELS, AudioFilePanel, ScreenPanel, SourcePanel
+from aquafonix.ui.plots import (COLORMAPS, LevelsPlot, OverviewPlot, PreviewView, SpectrogramView,
+                                SpectrumPlot, TimePlot, channel_color)
+from aquafonix.ui.review import DetectionsPanel, EventsPanel
 from aquafonix.ui.widgets import combo, named, restore_state, save_state, set_widget_value, spin
 
 log = logging.getLogger(__name__)
-FFT_SIZES = ["256", "512", "1024", "2048", "4096", "8192", "16384", "32768", "65536"]
+
+SHORTCUTS = """\
+F5  start / stop          F6  pause (explore history) / live
+F9  capture the last N seconds as an event
++ / -  zoom time in / out     Ctrl+Up / Ctrl+Down  zoom Y     0  fit
+S  selection tool (or Shift-drag on the waveform / spectrogram)
+Z  zoom to selection     I  identify selection     P  play selection
+L  listen live     Esc  stop playback / clear selection
+C / X  confirm / reject the selected detection
+Mouse wheel zooms, drag pans; right-click a plot for more options."""
 
 
 def _fmt(v: float) -> str:
@@ -34,30 +56,46 @@ def _fmt(v: float) -> str:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings: QSettings) -> None:
+    def __init__(self, settings: QSettings, data_dir: Path) -> None:
         super().__init__()
         self.settings = settings
-        self.persist = True  # save settings on close
+        self.persist = True
+        self.data_dir = Path(settings.value("data/dir", str(data_dir)))
+        self.library = SignatureLibrary(self.data_dir / "signatures")
+        self.matcher = Matcher(self.library)
+        self.store = EventStore(self.data_dir / "events")
+        self.player = Player()
         self.source: Source | None = None
         self.buffer: RingBuffer | None = None
+        self.analyzer: Analyzer | None = None
         self.recorder: CsvRecorder | WavRecorder | None = None
-        self.paused = False
+        self.explore = False  # display frozen; the user navigates the history
+        self._wall0: float | None = None
+        self._sel: tuple[float, float, float | None, float | None] | None = None
+        self._selected_det: int | None = None
         self._last_version = -1
         self._last_frame = None
-        self._spec_avg: dict[str, np.ndarray] = {}
         self._view: tuple[np.ndarray, np.ndarray, list[str]] | None = None
+        self._spec_avg: dict[str, np.ndarray] = {}
         self._rate_mark = (time.perf_counter(), 0)
+        self._slow_t = 0.0
         self._status_t = 0.0
         self._trigger_waiting = False
         self._outline_region: Region | None = None
         self._last_dir = str(Path.home())
+        self._explore_pending = False
+        self._seeking = False
+        self._last_det_id = 0
+        self._det_table_t = 0.0
         self.setWindowTitle(f"{APP_NAME} {__version__}")
-        self.resize(1280, 800)
+        self.resize(1440, 900)
         self.selector = RegionSelector(self)
         self.selector.finished.connect(self._region_selected)
         self.outline = RegionOutline()
         self._build()
         self._restore()
+        self.events_panel.set_store(self.store)
+        self.events_panel.set_tag_suggestions(self.library.labels())
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._refresh)
         self.timer.start(33)
@@ -66,12 +104,117 @@ class MainWindow(QMainWindow):
     # layout
     # ======================================================================
     def _build(self) -> None:
-        side = QWidget()
-        sl = QVBoxLayout(side)
+        self._build_actions()
+        self._build_controls()
+        self._build_plots()
+        self._build_review()
+        self.status_label = QLabel("")
+        self.statusBar().addWidget(self.status_label, 1)
+        self.alarm_label = QLabel("")
+        self.statusBar().addPermanentWidget(self.alarm_label)
+        self._wire()
 
-        # -- source --------------------------------------------------------
-        box = QGroupBox("Source")
-        bl = QVBoxLayout(box)
+    def _action(self, text, slot, shortcut=None, checkable=False, tip=None) -> QAction:
+        act = QAction(text, self)
+        if shortcut:
+            act.setShortcut(QKeySequence(shortcut))
+            act.setShortcutContext(Qt.WindowShortcut)
+        act.setCheckable(checkable)
+        if tip:
+            act.setToolTip(f"{tip} ({shortcut})" if shortcut else tip)
+        (act.toggled if checkable else act.triggered).connect(slot)
+        self.addAction(act)
+        return act
+
+    def _build_actions(self) -> None:
+        a = self._action
+        self.act_start = a("▶ Start", self.toggle_running, "F5", tip="Start / stop the source")
+        self.act_pause = a("⏸ Pause", self._set_explore, "F6", checkable=True,
+                           tip="Freeze the display to explore the history; data keeps coming")
+        self.act_capture = a("⏺ Capture last 30 s", self.capture_event, "F9",
+                             tip="Save the recent history as an event to tag and annotate")
+        self.act_zoom_in = a("＋", lambda: self.zoom_x(0.5), "+", tip="Zoom in (time)")
+        self.act_zoom_out = a("－", lambda: self.zoom_x(2.0), "-", tip="Zoom out (time)")
+        QShortcut(QKeySequence("="), self, activated=lambda: self.zoom_x(0.5))
+        self.act_zoom_in_y = a("Y＋", lambda: self.zoom_y(0.5), "Ctrl+Up", tip="Zoom in (Y)")
+        self.act_zoom_out_y = a("Y－", lambda: self.zoom_y(2.0), "Ctrl+Down", tip="Zoom out (Y)")
+        self.act_fit = a("Fit", self.fit_view, "0", tip="Auto-scale / show the whole history")
+        self.act_box = a("⬚ Box zoom", self._set_box_zoom, checkable=True,
+                         tip="Drag a rectangle to zoom into it")
+        self.act_select = a("⇔ Select", self._set_select_mode, "S", checkable=True,
+                            tip="Drag to select a sound (Shift-drag works any time)")
+        self.act_zoom_sel = a("Zoom to selection", self.zoom_to_selection, "Z")
+        self.act_identify = a("🏷 Identify…", self.identify_selection, "I",
+                              tip="Name the selected sound so later occurrences are flagged")
+        self.act_play_sel = a("▶ Play selection", self.play_selection, "P")
+        self.act_save_sel = a("💾 Save selection", self.save_selection_event,
+                              tip="Save the selection as an event")
+        self.act_listen = a("🎧 Listen live", self._set_listen, "L", checkable=True)
+        self.act_stop_audio = a("■ Stop audio", self.stop_audio, tip="Stop playback (Esc)")
+        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self._escape)
+        QShortcut(QKeySequence("C"), self, activated=lambda: self._review("confirm"))
+        QShortcut(QKeySequence("X"), self, activated=lambda: self._review("reject"))
+
+        tb = QToolBar("Main")
+        tb.setObjectName("toolbar")
+        tb.setMovable(False)
+        self.addToolBar(tb)
+        for act in (self.act_start, self.act_pause, self.act_capture):
+            tb.addAction(act)
+        tb.addSeparator()
+        for act in (self.act_zoom_in, self.act_zoom_out, self.act_zoom_in_y,
+                    self.act_zoom_out_y, self.act_fit, self.act_box):
+            tb.addAction(act)
+        tb.addSeparator()
+        for act in (self.act_select, self.act_identify, self.act_play_sel, self.act_save_sel):
+            tb.addAction(act)
+        tb.addSeparator()
+        tb.addAction(self.act_listen)
+        tb.addAction(self.act_stop_audio)
+        tb.addWidget(QLabel(" Speed "))
+        self.play_speed = named(combo([f"{s:g}×" for s in SPEEDS], "1×"), "play.speed")
+        self.play_speed.setToolTip("Replay speed (time expansion): <1 lowers pitch of "
+                                   "ultrasonic sounds, >1 raises infrasonic ones")
+        tb.addWidget(self.play_speed)
+        self.denoise_on = named(QCheckBox("Denoise"), "play.denoise")
+        self.denoise_on.setToolTip("Spectral noise reduction when replaying clips")
+        tb.addWidget(self.denoise_on)
+        tb.addWidget(QLabel(" Volume "))
+        self.volume = named(spin(-40, 60, 0, suffix=" dB"), "play.volume")
+        self.volume.setToolTip("Live listening gain (hydrophone signals are often quiet)")
+        tb.addWidget(self.volume)
+
+        mb = self.menuBar()
+        m = mb.addMenu("&File")
+        m.addAction(self._action("Open audio file…", self.open_audio_file, "Ctrl+O"))
+        m.addAction(self._action("Open data folder", lambda: self._open_folder(self.data_dir)))
+        m.addSeparator()
+        m.addAction(self._action("Exit", self.close))
+        self.view_menu = mb.addMenu("&View")
+        m = mb.addMenu("&Tools")
+        for act in (self.act_capture, self.act_identify, self.act_play_sel, self.act_save_sel,
+                    self.act_listen):
+            m.addAction(act)
+        m.addAction(self._action("Signatures…", self.manage_signatures))
+        m = mb.addMenu("&Help")
+        m.addAction(self._action("Keyboard shortcuts", lambda: QMessageBox.information(
+            self, "Shortcuts", SHORTCUTS)))
+        m.addAction(self._action("About", lambda: QMessageBox.about(
+            self, APP_NAME, f"{APP_NAME} {__version__}\nReal-time monitor for audio, data "
+            "streams and on-screen graphs, with hydrophone analysis tools.")))
+
+    def _scroll(self, widget: QWidget) -> QScrollArea:
+        area = QScrollArea()
+        area.setWidget(widget)
+        area.setWidgetResizable(True)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return area
+
+    def _build_controls(self) -> None:
+        tabs = QTabWidget()
+        # -- Source --------------------------------------------------------
+        page = QWidget()
+        pl = QVBoxLayout(page)
         self.source_combo = named(QComboBox(), "source")
         self.panels: list[SourcePanel] = [cls() for cls in PANELS]
         self.stack = QStackedWidget()
@@ -79,20 +222,23 @@ class MainWindow(QMainWindow):
             self.source_combo.addItem(panel.title, panel.key)
             self.stack.addWidget(panel)
         self.screen_panel: ScreenPanel = next(p for p in self.panels if isinstance(p, ScreenPanel))
-        bl.addWidget(self.source_combo)
-        bl.addWidget(self.stack)
+        self.file_panel: AudioFilePanel = next(p for p in self.panels
+                                               if isinstance(p, AudioFilePanel))
+        pl.addWidget(self.source_combo)
+        pl.addWidget(self.stack)
         row = QHBoxLayout()
         self.start_btn = QPushButton("▶  Start")
         self.stop_btn = QPushButton("■  Stop")
-        self.start_btn.setToolTip("Start (F5)")
-        self.stop_btn.setToolTip("Stop (F5)")
         row.addWidget(self.start_btn)
         row.addWidget(self.stop_btn)
-        bl.addLayout(row)
-        sl.addWidget(box)
+        pl.addLayout(row)
+        pl.addStretch(1)
+        tabs.addTab(self._scroll(page), "Source")
 
-        # -- display -------------------------------------------------------
-        box = QGroupBox("Display")
+        # -- Display -------------------------------------------------------
+        page = QWidget()
+        dl = QVBoxLayout(page)
+        box = QGroupBox("Waveform")
         f = QFormLayout(box)
         self.xaxis = named(combo({"time": "Time (s)", "samples": "Sample number"}, "time"),
                            "display.xaxis")
@@ -121,39 +267,95 @@ class MainWindow(QMainWindow):
         yrow.addWidget(self.y_min)
         yrow.addWidget(QLabel("to"))
         yrow.addWidget(self.y_max)
+        yrow.setContentsMargins(0, 0, 0, 0)
         self.y_row = QWidget()
         self.y_row.setLayout(yrow)
-        yrow.setContentsMargins(0, 0, 0, 0)
         f.addRow("Y range", self.y_row)
-        self.spectrum_on = named(QCheckBox("Show spectrum (FFT)"), "display.spectrum")
-        f.addRow(self.spectrum_on)
-        self.fft_size = named(combo(FFT_SIZES, "4096"), "display.fftsize")
-        self.fft_log = named(QCheckBox("Log frequency axis"), "display.fftlog")
-        self.fft_avg = named(spin(0, 0.99, 0.5, decimals=2, step=0.05), "display.fftavg")
-        f.addRow("FFT size", self.fft_size)
-        f.addRow(self.fft_log)
-        f.addRow("Averaging", self.fft_avg)
-        row = QHBoxLayout()
-        self.pause_btn = QPushButton("⏸  Pause")
-        self.pause_btn.setCheckable(True)
-        self.pause_btn.setToolTip("Freeze the display; data keeps arriving (F6)")
-        clear = QPushButton("Clear")
-        clear.clicked.connect(self.clear)
-        row.addWidget(self.pause_btn)
-        row.addWidget(clear)
-        f.addRow(row)
+        self.overview_on = named(QCheckBox("History overview strip"), "display.overview")
+        self.overview_on.setChecked(True)
+        f.addRow(self.overview_on)
         self._display_form = f
-        sl.addWidget(box)
+        dl.addWidget(box)
 
-        # -- record --------------------------------------------------------
-        box = QGroupBox("Record && export")
-        rl = QVBoxLayout(box)
+        box = QGroupBox("Spectrogram")
+        f = QFormLayout(box)
+        self.spectro_on = named(QCheckBox("Show spectrogram"), "display.spectro")
+        self.spectro_on.setChecked(True)
+        f.addRow(self.spectro_on)
+        self.cmap = named(combo({k: k.capitalize() for k in COLORMAPS}, "inferno"), "display.cmap")
+        f.addRow("Colours", self.cmap)
+        self.spec_snr = named(QCheckBox("Show relative to noise floor"), "display.snr")
+        self.spec_snr.setToolTip("Whitens the background so faint calls stand out")
+        f.addRow(self.spec_snr)
+        self.db_auto = named(QCheckBox("Auto level range"), "display.dbauto")
+        self.db_auto.setChecked(True)
+        f.addRow(self.db_auto)
+        self.db_range = named(spin(10, 200, 60, suffix=" dB"), "display.dbrange")
+        f.addRow("Dynamic range", self.db_range)
+        self.f_max = named(spin(0, 1e6, 0, decimals=0, suffix=" Hz"), "display.fmax")
+        self.f_max.setSpecialValueText("Nyquist")
+        f.addRow("Max frequency", self.f_max)
+        dl.addWidget(box)
+
+        box = QGroupBox("Spectrum && levels")
+        f = QFormLayout(box)
+        self.spectrum_on = named(QCheckBox("Show spectrum"), "display.spectrum")
+        f.addRow(self.spectrum_on)
+        self.fft_log = named(QCheckBox("Log frequency axis"), "display.fftlog")
+        f.addRow(self.fft_log)
+        self.fft_avg = named(spin(0, 0.99, 0.7, decimals=2, step=0.05), "display.fftavg")
+        f.addRow("Averaging", self.fft_avg)
+        self.levels_on = named(QCheckBox("Show levels over time"), "display.levels")
+        self.levels_on.setChecked(True)
+        f.addRow(self.levels_on)
+        self._spec_form = f
+        dl.addWidget(box)
+        dl.addStretch(1)
+        tabs.addTab(self._scroll(page), "Display")
+
+        # -- Acoustics -----------------------------------------------------
+        self.acoustics = AcousticsPanel()
+        tabs.addTab(self._scroll(self.acoustics), "Acoustics")
+
+        # -- Record --------------------------------------------------------
+        page = QWidget()
+        rl = QVBoxLayout(page)
+        box = QGroupBox("History && event capture")
+        f = QFormLayout(box)
+        self.history_s = named(spin(30, 3600, 60, suffix=" s"), "record.history")
+        self.history_s.setToolTip("How much recent data is kept in memory (applies at next Start)")
+        f.addRow("Keep history", self.history_s)
+        self.pre_roll = named(spin(1, 3600, 30, suffix=" s"), "record.preroll")
+        self.post_roll = named(spin(0, 600, 0, suffix=" s"), "record.postroll")
+        f.addRow("Capture before press", self.pre_roll)
+        f.addRow("…and after press", self.post_roll)
+        cap = QPushButton("⏺ Capture now (F9)")
+        cap.clicked.connect(self.capture_event)
+        f.addRow(cap)
+        self.save_reviewed = named(QCheckBox("Save confirmed / corrected detections as events"),
+                                   "record.savereviewed")
+        self.save_reviewed.setChecked(True)
+        f.addRow(self.save_reviewed)
+        self.data_label = QLabel(str(self.data_dir))
+        self.data_label.setWordWrap(True)
+        f.addRow("Data folder", self.data_label)
+        row = QHBoxLayout()
+        change = QPushButton("Change…")
+        change.clicked.connect(self._choose_data_dir)
+        opener = QPushButton("Open")
+        opener.clicked.connect(lambda: self._open_folder(self.data_dir))
+        row.addWidget(change)
+        row.addWidget(opener)
+        f.addRow(row)
+        rl.addWidget(box)
+        box = QGroupBox("Continuous recording && export")
+        bl = QVBoxLayout(box)
         self.record_btn = QPushButton("●  Record to file…")
         self.record_btn.setCheckable(True)
-        rl.addWidget(self.record_btn)
+        bl.addWidget(self.record_btn)
         self.record_label = QLabel("")
         self.record_label.setWordWrap(True)
-        rl.addWidget(self.record_label)
+        bl.addWidget(self.record_label)
         row = QHBoxLayout()
         save_csv = QPushButton("Save view as CSV…")
         save_png = QPushButton("Save image…")
@@ -161,75 +363,134 @@ class MainWindow(QMainWindow):
         save_png.clicked.connect(self._save_image)
         row.addWidget(save_csv)
         row.addWidget(save_png)
-        rl.addLayout(row)
-        sl.addWidget(box)
-        sl.addStretch(1)
+        bl.addLayout(row)
+        rl.addWidget(box)
+        rl.addStretch(1)
+        tabs.addTab(self._scroll(page), "Record")
 
-        scroll = QScrollArea()
-        scroll.setWidget(side)
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(370)
+        self.control_tabs = tabs
+        dock = QDockWidget("Controls", self)
+        dock.setObjectName("controls")
+        dock.setWidget(tabs)
+        dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable
+                         | QDockWidget.DockWidgetClosable)
+        dock.setMinimumWidth(380)
+        self.addDockWidget(Qt.LeftDockWidgetArea, dock)
+        self.view_menu.addAction(dock.toggleViewAction())
 
-        # -- plots ---------------------------------------------------------
+    def _build_plots(self) -> None:
         self.preview = PreviewView()
+        self.overview = OverviewPlot()
         self.time_plot = TimePlot()
         self.time_plot.setAutoVisible(y=True)
+        self.spectro = SpectrogramView()
+        self.spectro.setXLink(self.time_plot)
         self.spec_plot = SpectrumPlot()
-        self.plot_split = QSplitter(Qt.Vertical)
-        for w in (self.preview, self.time_plot, self.spec_plot):
-            self.plot_split.addWidget(w)
-        self.plot_split.setStretchFactor(0, 2)
-        self.plot_split.setStretchFactor(1, 3)
-        self.plot_split.setStretchFactor(2, 2)
+        self.levels_plot = LevelsPlot()
+
+        # transport bar for replaying files
+        self.transport = QWidget()
+        tl = QHBoxLayout(self.transport)
+        tl.setContentsMargins(4, 0, 4, 0)
+        self.tr_play = QPushButton("⏸")
+        self.tr_play.setFixedWidth(40)
+        self.tr_play.clicked.connect(self._transport_toggle)
+        self.tr_slider = QSlider(Qt.Horizontal)
+        self.tr_slider.setRange(0, 10000)
+        self.tr_slider.sliderPressed.connect(lambda: setattr(self, "_seeking", True))
+        self.tr_slider.sliderReleased.connect(self._transport_seek)
+        self.tr_label = QLabel("")
+        self.tr_speed = combo(AudioFilePanel.SPEEDS, "1")
+        self.tr_speed.activated.connect(self._transport_speed)
+        tl.addWidget(self.tr_play)
+        tl.addWidget(self.tr_slider, 1)
+        tl.addWidget(self.tr_label)
+        tl.addWidget(self.tr_speed)
+        self.transport.setVisible(False)
+
+        wave = QWidget()
+        wl = QVBoxLayout(wave)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.setSpacing(0)
+        wl.addWidget(self.transport)
+        wl.addWidget(self.overview)
+        wl.addWidget(self.time_plot, 1)
         self.readout = QLabel("")
         self.readout.setTextFormat(Qt.RichText)
         self.readout.setWordWrap(True)
-        self.plots = QWidget()
-        pl = QVBoxLayout(self.plots)
-        pl.setContentsMargins(0, 0, 0, 0)
-        pl.addWidget(self.plot_split, 1)
-        pl.addWidget(self.readout)
+        wl.addWidget(self.readout)
 
-        self.main_split = QSplitter(Qt.Horizontal)
-        self.main_split.addWidget(scroll)
-        self.main_split.addWidget(self.plots)
-        self.main_split.setStretchFactor(1, 1)
-        self.main_split.setSizes([390, 890])
-        self.setCentralWidget(self.main_split)
-        self.status_label = QLabel("")
-        self.statusBar().addWidget(self.status_label, 1)
+        self.plot_split = QSplitter(Qt.Vertical)
+        for w in (self.preview, wave, self.spectro, self.spec_plot, self.levels_plot):
+            self.plot_split.addWidget(w)
+        for i, stretch in enumerate((2, 3, 3, 2, 2)):
+            self.plot_split.setStretchFactor(i, stretch)
+        self.plots = self.plot_split
+        self.setCentralWidget(self.plot_split)
 
-        # -- wiring --------------------------------------------------------
+    def _build_review(self) -> None:
+        self.det_panel = DetectionsPanel()
+        self.events_panel = EventsPanel()
+        self.review_tabs = QTabWidget()
+        self.review_tabs.addTab(self.det_panel, "Detections")
+        self.review_tabs.addTab(self.events_panel, "Saved events")
+        dock = QDockWidget("Detections && events", self)
+        dock.setObjectName("review")
+        dock.setWidget(self.review_tabs)
+        self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+        self.view_menu.addAction(dock.toggleViewAction())
+
+    def _wire(self) -> None:
         self.source_combo.currentIndexChanged.connect(self._source_changed)
         self.start_btn.clicked.connect(self.start)
         self.stop_btn.clicked.connect(self.stop)
-        self.pause_btn.toggled.connect(self._set_paused)
         self.record_btn.toggled.connect(self._toggle_record)
-        for w in (self.xaxis, self.mode):
+        for w in (self.xaxis, self.mode, self.cmap):
             w.currentIndexChanged.connect(self._display_changed)
-        for w in (self.y_auto, self.spectrum_on, self.fft_log):
+        for w in (self.y_auto, self.spectrum_on, self.fft_log, self.spectro_on, self.levels_on,
+                  self.overview_on, self.spec_snr, self.db_auto):
             w.toggled.connect(self._display_changed)
-        for w in (self.y_min, self.y_max, self.window_s, self.window_n):
+        for w in (self.y_min, self.y_max, self.window_s, self.window_n, self.db_range,
+                  self.f_max):
             w.valueChanged.connect(self._display_changed)
-        self.fft_size.currentIndexChanged.connect(lambda *_: self._spec_avg.clear())
+        self.pre_roll.valueChanged.connect(self._update_capture_text)
         self.trig_level.valueChanged.connect(self._trigger_level_edited)
         self.time_plot.trigger_line.sigPositionChanged.connect(
             lambda line: self.trig_level.setValue(line.value()))
-        QShortcut(QKeySequence(Qt.Key_F5), self, activated=self.toggle_running)
-        QShortcut(QKeySequence(Qt.Key_F6), self, activated=self.pause_btn.toggle)
+        self.time_plot.vb.sigSelect.connect(self._wave_select)
+        self.spectro.vb.sigSelect.connect(self._spectro_select)
+        self.time_plot.selection.sigRegionChangeFinished.connect(self._selection_dragged)
+        self.time_plot.vb.sigXRangeChanged.connect(self._view_moved)
+        self.overview.region_dragged.connect(self._overview_dragged)
+        self.acoustics.changed.connect(self._acoustics_changed)
+        self.acoustics.band_from_selection.connect(self._band_from_selection)
+        self.acoustics.manage_signatures.connect(self.manage_signatures)
 
         sp = self.screen_panel
         sp.select_requested.connect(self._select_region)
         sp.save_trace_requested.connect(self._save_trace)
+        sp.autodetect_requested.connect(self._autodetect_traces)
         sp.region_changed.connect(lambda _r: self._update_outline())
         sp.cal_line_changed.connect(self.preview.set_line)
         sp.changed.connect(self._screen_settings_changed)
         self.preview.line_moved.connect(sp.set_cal_px)
         self.preview.pixel_clicked.connect(self._preview_clicked)
 
+        d = self.det_panel
+        d.confirm.connect(self.confirm_detection)
+        d.correct.connect(self.correct_detection)
+        d.reject.connect(self.reject_detection)
+        d.identify.connect(self.identify_detection)
+        d.play.connect(self.play_detection)
+        d.zoom.connect(self.show_detection)
+        d.save_event.connect(self.save_detection_event)
+        d.selected.connect(self._detection_selected)
+        self.events_panel.play.connect(self.play_event)
+        self.events_panel.open_in_replay.connect(self.replay_event)
+
         self._source_changed()
         self._display_changed()
+        self._update_capture_text()
 
     # ======================================================================
     # public API (also used by the command line)
@@ -268,7 +529,12 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, APP_NAME, f"Can't start: {exc}")
             return False
-        buffer = RingBuffer(max(1000, src.buffer_capacity))
+        history = float(self.history_s.value())
+        if src.sample_rate:
+            buffer = RingBuffer(int(src.sample_rate * history) + 1, src.sample_dtype,
+                                src.sample_rate)
+        else:
+            buffer = RingBuffer(max(1000, src.buffer_capacity))
         try:
             src.start(buffer)
         except Exception as exc:
@@ -276,17 +542,44 @@ class MainWindow(QMainWindow):
             src.stop()
             QMessageBox.warning(self, APP_NAME, f"Could not start {panel.title}:\n\n{exc}")
             return False
+        self._stop_analyzer()
         self.source, self.buffer = src, buffer
+        live = not isinstance(src, AudioFileSource)
+        self._wall0 = time.time() if live else None
+        self.analyzer = Analyzer(buffer, self.matcher, self.acoustics.settings(),
+                                 src.sample_rate, history, self._wall_clock)
+        self.analyzer.start()
+        if isinstance(src, AudioFileSource):
+            src.throttle = lambda: self.analyzer.processed_index if self.analyzer else 0
+            self.tr_speed.setCurrentIndex(max(0, self.tr_speed.findData(
+                self.file_panel.speed.currentData())))
+        self.det_panel.clear()
+        self._last_det_id = 0
+        self._sel = None
+        self.time_plot.clear_selection()
+        self.spectro.clear_selection()
+        self.time_plot.overlay.clear()
+        self.spectro.overlay.clear()
         self._reset_view()
+        self.act_pause.setChecked(False)
         self._update_buttons()
         self._display_changed()
         return True
 
     def stop(self) -> None:
         self._stop_recording()
+        if self.act_listen.isChecked():
+            self.act_listen.setChecked(False)
         if self.source is not None:
             self.source.stop()
+        if self.analyzer is not None:
+            self.analyzer.stop()  # keep results for review
         self._update_buttons()
+
+    def _stop_analyzer(self) -> None:
+        if self.analyzer is not None:
+            self.analyzer.stop()
+            self.analyzer = None
 
     def clear(self) -> None:
         if self.buffer is not None:
@@ -294,6 +587,17 @@ class MainWindow(QMainWindow):
         if isinstance(self.source, ScreenSource):
             self.source.stitcher.reset()
         self._reset_view()
+
+    def _wall_clock(self, t: float) -> float | None:
+        return self._wall0 + t if self._wall0 is not None else None
+
+    def _source_desc(self) -> str:
+        src = self.source
+        if src is None:
+            return ""
+        if isinstance(src, AudioFileSource):
+            return f"file {Path(src.path).name}"
+        return f"{self.current_panel().title}: {src.status.split(' · ')[0]}"[:200]
 
     # ======================================================================
     # display refresh
@@ -307,23 +611,75 @@ class MainWindow(QMainWindow):
         self._view = None
         self.readout.setText("")
 
+    def _display_buffer(self) -> RingBuffer | None:
+        """Band-filtered stream when band isolation is on, else the raw one."""
+        a = self.analyzer
+        if (a is not None and a.filtered is not None and self.acoustics.band() is not None
+                and self.acoustics.band_show.isChecked() and len(a.filtered)):
+            return a.filtered
+        return self.buffer
+
     def _refresh(self) -> None:
         self._update_status()
         src, buf = self.source, self.buffer
-        if src is None or buf is None or self.paused:
+        if src is None or buf is None:
             return
         if isinstance(src, ScreenSource):
             self._refresh_screen(src)
-            if src.output == "trace":
-                return
-        if buf.version == self._last_version:
-            return
-        self._last_version = buf.version
-        self._refresh_time(buf)
-        if self.spectrum_on.isChecked():
-            self._refresh_spectrum(src, buf)
+        trace_mode = isinstance(src, ScreenSource) and src.output == "trace"
+        if not self.explore and not trace_mode:
+            dbuf = self._display_buffer()
+            if dbuf is not None and dbuf.version != self._last_version:
+                self._last_version = dbuf.version
+                self._refresh_live(dbuf)
+                if self.spectro.isVisible():
+                    self._render_spectrogram(*self.time_plot.viewRange()[0])
+        elif self._explore_pending:
+            self._explore_pending = False
+            self._render_explore()
+        self._refresh_detections()
+        if self.player.mode == "clip" and self.player.playing:
+            self.time_plot.playhead.setValue(self.player.clip_start + self.player.position)
+            self.time_plot.playhead.setVisible(True)
+        elif self.time_plot.playhead.isVisible():
+            self.time_plot.playhead.setVisible(False)
+        now = time.perf_counter()
+        if now - self._slow_t > 0.5:
+            self._slow_t = now
+            self._refresh_slow()
 
-    def _refresh_time(self, buf: RingBuffer) -> None:
+    def _refresh_slow(self) -> None:
+        """Twice a second: overview, spectrum, levels, noise report, transport."""
+        buf = self._display_buffer()
+        if self.overview.isVisible() and buf is not None and len(buf):
+            snap = buf.latest()
+            if len(snap) and snap.y.shape[1]:
+                xd, yd = minmax_decimate(snap.x, snap.y[:, :1], 1500)
+                self.overview.set_data(xd, yd[:, 0])
+            self.overview.set_region(*self.time_plot.viewRange()[0])
+        a = self.analyzer
+        if a is not None:
+            if self.spec_plot.isVisible():
+                self._refresh_spectrum(a)
+            if self.levels_plot.isVisible() and a.long_levels.count:
+                t, v = a.long_levels.latest(a.long_levels.count)
+                self.levels_plot.set_data(t, v, a.offset_db, a.units,
+                                          self.acoustics.band() is not None)
+                st = self.acoustics.settings()
+                self.levels_plot.set_alarm(st.floor_alarm_db if st.floor_alarm else None)
+            self.acoustics.show_report(a.report, a.alarm)
+            self.alarm_label.setText("⚠ NOISE FLOOR ALARM" if a.alarm else "")
+            self.alarm_label.setStyleSheet("color:#ff5050; font-weight:bold;" if a.alarm else "")
+        src = self.source
+        if isinstance(src, AudioFileSource):
+            if not self._seeking and src.duration:
+                self.tr_slider.blockSignals(True)
+                self.tr_slider.setValue(int(10000 * src.position / src.duration))
+                self.tr_slider.blockSignals(False)
+            self.tr_label.setText(f"{src.position:8.2f} / {src.duration:.2f} s")
+            self.tr_play.setText("▶" if src.paused or src.finished else "⏸")
+
+    def _refresh_live(self, buf: RingBuffer) -> None:
         samples_axis = self.xaxis.currentData() == "samples"
         triggered = self.mode.currentData() == "trigger"
         if samples_axis:
@@ -356,30 +712,96 @@ class MainWindow(QMainWindow):
                 x_range = (-0.1 * span, 0.9 * span)
                 keep = (x >= x_range[0]) & (x <= x_range[1])
             x, y = x[keep], y[keep]
-        self._view = (x, y, names)
-        xd, yd = minmax_decimate(x, y, 4 * max(200, self.time_plot.width()))
-        self.time_plot.set_series(xd, yd, names)
+        self._show_series(x, y, names)
         self.time_plot.setXRange(*x_range, padding=0)
         self._apply_y_range()
         self._update_readout(names, y)
 
-    def _refresh_spectrum(self, src: Source, buf: RingBuffer) -> None:
-        nfft = int(self.fft_size.currentText())
-        snap = buf.latest(nfft)
-        rate = src.sample_rate or estimate_rate(snap.x)
-        if not rate or len(snap) < 16:
+    def _show_series(self, x, y, names) -> None:
+        self._view = (x, y, names)
+        xd, yd = minmax_decimate(x, y, 4 * max(200, self.time_plot.width()))
+        self.time_plot.set_series(xd, yd, names)
+
+    def _render_explore(self) -> None:
+        """Paused: draw whatever part of the history is in view."""
+        buf = self._display_buffer()
+        if buf is None:
             return
+        x0, x1 = self.time_plot.viewRange()[0]
+        if self.xaxis.currentData() == "samples":
+            i0 = max(int(np.floor(x0)), buf.first_index)
+            snap = buf.from_index(i0, max_n=max(0, int(np.ceil(x1)) - i0 + 1))
+            x = snap.first_index + np.arange(len(snap), dtype=float)
+        else:
+            snap = buf.range(x0, x1)
+            x = snap.x
+        if len(snap):
+            self._show_series(x, snap.y, snap.names)
+            self._update_readout(snap.names, snap.y)
+        if self.spectro.isVisible():
+            self._render_spectrogram(x0, x1)
+
+    def _render_spectrogram(self, x0: float, x1: float) -> None:
+        a = self.analyzer
+        if a is None or a.spectro is None or not a.rate:
+            return
+        t, d = a.spectro.range(x0, x1)
+        if len(t) < 2:
+            return
+        width = max(200, self.spectro.width())
+        if len(t) > 2 * width:  # keep peaks when squeezing many frames into few pixels
+            step = len(t) // width
+            m = (len(t) // step) * step
+            d = d[len(t) - m:].reshape(-1, step, d.shape[1]).max(axis=1)
+            t = t[len(t) - m:][step - 1::step]
+        if self.spec_snr.isChecked():
+            floor = a.floor_snapshot()
+            if floor is not None:
+                d = d - floor[1]
+        else:
+            df = a.rate / a.nfft
+            d = d + a.offset_db - 10 * np.log10(df)  # power per bin -> spectral density
+        nyq = a.rate / 2
+        f_max = self.f_max.value() or nyq
+        bins = int(np.searchsorted(a.freqs, min(f_max, nyq), side="right"))
+        img = d[:, :max(bins, 2)].T
+        if self.db_auto.isChecked() or self.spec_snr.isChecked():
+            hi = float(np.percentile(img, 99.7))
+            lo = hi - self.db_range.value() if not self.spec_snr.isChecked() else 0.0
+            if self.spec_snr.isChecked():
+                hi = max(hi, 10.0)
+        else:
+            hi = float(np.max(img))
+            lo = hi - self.db_range.value()
+        half = a.hop / a.rate / 2
+        self.spectro.set_image(t[0] - half, t[-1] + half, float(a.freqs[max(bins, 2) - 1]), img,
+                               (lo, hi))
+        band = self.acoustics.band()
+        if band is not None:
+            lo_b, hi_b = band.edges(a.rate)
+            self.spectro.set_band(lo_b, hi_b)
+        else:
+            self.spectro.set_band(None, None)
+
+    def _refresh_spectrum(self, a: Analyzer) -> None:
+        if a.spectro is None or not a.spectro.count:
+            return
+        n = max(1, int(0.25 / max(a.hop / a.rate, 1e-6)))
+        _t, d = a.spectro.latest(n)
+        if not len(d):
+            return
+        db = 10 * np.log10(np.mean(10 ** (d / 10), axis=0)) + a.offset_db
         alpha = self.fft_avg.value()
-        for i, name in enumerate(snap.names):
-            freqs, db = spectrum(snap.y[:, i], rate, nfft)
-            if len(freqs) < 2:
-                continue
-            freqs, db = freqs[1:], db[1:]  # drop DC (log axis can't show 0 Hz)
-            prev = self._spec_avg.get(name)
-            if prev is not None and prev.shape == db.shape and alpha > 0:
-                db = alpha * prev + (1 - alpha) * db
-            self._spec_avg[name] = db
-            self.spec_plot.curve(name).setData(freqs, db)
+        prev = self._spec_avg.get("live")
+        if prev is not None and prev.shape == db.shape:
+            db = alpha * prev + (1 - alpha) * db
+        self._spec_avg["live"] = db
+        freqs = a.freqs[1:]
+        self.spec_plot.curve("level").setData(freqs, db[1:])
+        floor = a.floor_snapshot()
+        if floor is not None:
+            self.spec_plot.floor_curve.setData(freqs, floor[1][1:] + a.offset_db)
+        self.spec_plot.setLabel("left", "Level", units=f"{a.units} per bin")
 
     def _refresh_screen(self, src: ScreenSource) -> None:
         frame = src.latest
@@ -391,21 +813,20 @@ class MainWindow(QMainWindow):
         if src.output != "stitch" and src.probe == "column" and len(r.x_px):
             probe_px = src.probe_column * (len(r.x_px) - 1) + 0.5
         if self.preview.isVisible():
-            mask = r.mask if self.screen_panel.show_mask.isChecked() else None
-            self.preview.set_frame(frame.image, r.x_px, r.y_px, mask, probe_px)
-        self.screen_panel.show_detected(r.color, r.background)
-        if src.output == "trace":
-            names = [src.channel_name]
-            y = r.y[:, None]
-            self._view = (r.x, y, names)
-            self.time_plot.set_series(r.x, y, names)
+            self.preview.set_frame(frame.image, r, self.screen_panel.show_mask.isChecked(),
+                                   probe_px)
+        self.screen_panel.show_detected(r)
+        if src.output == "trace" and not self.explore:
+            y = r.y
+            self._view = (r.x, y, r.names)
+            self.time_plot.set_series(r.x, y, r.names)
             finite = np.isfinite(r.x)
             if finite.any():
                 lo, hi = float(np.min(r.x[finite])), float(np.max(r.x[finite]))
                 if hi > lo:
                     self.time_plot.setXRange(lo, hi, padding=0.01)
             self._apply_y_range()
-            self._update_readout(names, y)
+            self._update_readout(r.names, y)
 
     def _apply_y_range(self) -> None:
         if self.y_auto.isChecked():
@@ -455,14 +876,19 @@ class MainWindow(QMainWindow):
             parts = [src.status]
             if src.running:
                 parts.append(f"{rate:,.0f} samples/s")
-            if self.buffer is not None:
+            if self.buffer is not None and self.buffer.sample_rate:
+                parts.append(f"history {self.buffer.duration:.0f} s")
+            elif self.buffer is not None:
                 parts.append(f"{len(self.buffer):,} buffered")
+            a = self.analyzer
+            if a is not None and a.error:
+                parts.append(f"analysis: {a.error}")
             if self._trigger_waiting and self.mode.currentData() == "trigger":
                 parts.append("waiting for trigger")
             if self.recorder is not None:
                 parts.append(f"● REC {self.recorder.rows:,} samples")
-            if self.paused:
-                parts.append("display paused")
+            if self.explore:
+                parts.append("PAUSED — exploring history (F6 for live)")
             text = "  ·  ".join(parts)
         self._status_t = now
         self.status_label.setText(text)
@@ -472,8 +898,478 @@ class MainWindow(QMainWindow):
         running = self.running
         self.start_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
+        self.act_start.setText("■ Stop" if running else "▶ Start")
         if not running and self.recorder is not None:
             self._stop_recording()
+
+    # ======================================================================
+    # zoom / explore
+    # ======================================================================
+    def _set_explore(self, on: bool) -> None:
+        self.explore = on
+        self.act_pause.setText("▶ Live" if on else "⏸ Pause")
+        if on:
+            self._explore_pending = True
+        else:
+            self._last_version = -1
+
+    def _enter_explore(self) -> None:
+        if not self.explore:
+            self.act_pause.setChecked(True)
+
+    def _view_moved(self, *_args) -> None:
+        if self.explore:
+            self._explore_pending = True
+
+    def zoom_x(self, factor: float) -> None:
+        if not self.explore:
+            if self.xaxis.currentData() == "samples":
+                self.window_n.setValue(max(10, int(self.window_n.value() * factor)))
+            else:
+                self.window_s.setValue(min(max(self.window_s.value() * factor, 0.001),
+                                           self.window_s.maximum()))
+            return
+        (x0, x1), _ = self.time_plot.viewRange()
+        c, half = (x0 + x1) / 2, (x1 - x0) / 2 * factor
+        self.time_plot.setXRange(c - half, c + half, padding=0)
+
+    def zoom_y(self, factor: float) -> None:
+        _, (y0, y1) = self.time_plot.viewRange()
+        c, half = (y0 + y1) / 2, (y1 - y0) / 2 * factor
+        self.y_auto.setChecked(False)
+        self.y_min.setValue(c - half)
+        self.y_max.setValue(c + half)
+
+    def fit_view(self) -> None:
+        self.y_auto.setChecked(True)
+        if self.explore and self.buffer is not None and len(self.buffer):
+            if self.xaxis.currentData() == "samples":
+                self.time_plot.setXRange(self.buffer.first_index, self.buffer.total, padding=0)
+            else:
+                self.time_plot.setXRange(self.buffer.first_x(), self.buffer.last_x(), padding=0)
+        self._apply_y_range()
+
+    def zoom_to_selection(self) -> None:
+        if self._sel is None:
+            return
+        self._enter_explore()
+        t0, t1 = self._sel[:2]
+        pad = 0.1 * (t1 - t0)
+        self.time_plot.setXRange(t0 - pad, t1 + pad, padding=0)
+
+    def _overview_dragged(self, x0: float, x1: float) -> None:
+        self._enter_explore()
+        self.time_plot.setXRange(x0, x1, padding=0)
+
+    def _set_box_zoom(self, on: bool) -> None:
+        mode = self.time_plot.vb.RectMode if on else self.time_plot.vb.PanMode
+        self.time_plot.vb.setMouseMode(mode)
+        self.spectro.vb.setMouseMode(mode)
+        if on:
+            self.act_select.setChecked(False)
+            self._enter_explore()
+
+    def _set_select_mode(self, on: bool) -> None:
+        self.time_plot.vb.select_mode = on
+        self.spectro.vb.select_mode = on
+        if on:
+            self.act_box.setChecked(False)
+
+    # ======================================================================
+    # selection, identification and replay of selections
+    # ======================================================================
+    def _wave_select(self, x0, x1, _y0, _y1, finished) -> None:
+        self._enter_explore()
+        t0, t1 = sorted((x0, x1))
+        self.time_plot.set_selection(t0, t1)
+        self.spectro.clear_selection()
+        self._sel = (t0, t1, None, None)
+
+    def _spectro_select(self, x0, x1, f0, f1, finished) -> None:
+        self._enter_explore()
+        t0, t1 = sorted((x0, x1))
+        lo, hi = sorted((max(0.0, f0), max(0.0, f1)))
+        self.spectro.set_selection(t0, t1, lo, hi)
+        self.time_plot.set_selection(t0, t1)
+        self._sel = (t0, t1, lo, hi)
+
+    def _selection_dragged(self) -> None:
+        span = self.time_plot.selected_span()
+        if span is not None:
+            lo, hi = (self._sel[2], self._sel[3]) if self._sel else (None, None)
+            self._sel = (span[0], span[1], lo, hi)
+            if lo is not None:
+                self.spectro.set_selection(span[0], span[1], lo, hi)
+
+    def _escape(self) -> None:
+        if self.player.playing:
+            self.stop_audio()
+        else:
+            self._sel = None
+            self.time_plot.clear_selection()
+            self.spectro.clear_selection()
+
+    def _need_selection(self) -> tuple | None:
+        if self._sel is None or self._sel[1] - self._sel[0] <= 0:
+            QMessageBox.information(self, APP_NAME, "Select a sound first: Shift-drag on the "
+                                    "waveform (time) or the spectrogram (time and frequency), "
+                                    "or turn on the Select tool (S).")
+            return None
+        return self._sel
+
+    def _clip(self, t0: float, t1: float, all_channels: bool = False):
+        """``(clip, rate, t_start)`` from the raw history, or None."""
+        if self.buffer is None:
+            return None
+        snap = self.buffer.range(t0, t1)
+        if not len(snap):
+            return None
+        rate = (self.analyzer.rate if self.analyzer and self.analyzer.rate
+                else self.buffer.sample_rate)
+        if not rate:
+            return None
+        if all_channels:
+            return snap.y, float(rate), float(snap.x[0])
+        mono = self.analyzer.channel_signal(snap.y) if self.analyzer else snap.y[:, 0]
+        return mono, float(rate), float(snap.x[0])
+
+    def identify_selection(self) -> None:
+        sel = self._need_selection()
+        if sel is None:
+            return
+        t0, t1, lo, hi = sel
+        got = self._clip(t0, t1)
+        if got is None:
+            QMessageBox.information(self, APP_NAME, "That part of the history is no longer "
+                                    "in memory.")
+            return
+        clip, rate, _ = got
+        floor = self.analyzer.floor_snapshot() if self.analyzer else None
+        if lo is None:
+            lo, hi = estimate_band(clip, rate, *(floor or (None, None)))
+        self._identify(clip, rate, lo, hi, "", t0, t1, floor)
+
+    def _identify(self, clip, rate, lo, hi, suggested, t0, t1, floor,
+                  det: Detection | None = None) -> str | None:
+        dlg = IdentifyDialog(self, self.library.labels(), clip, rate, lo, hi, suggested,
+                             play=lambda: self._play_clip(clip, rate, t0))
+        if not dlg.exec():
+            return None
+        v = dlg.values()
+        try:
+            sig, _ex = self.library.add_example(
+                v["label"], clip, rate, v["f_lo"], v["f_hi"], "positive", v["method"],
+                v["category"], v["notes"], self._source_desc(), floor)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not save the signature:\n{exc}")
+            return None
+        if v["save_event"]:
+            self._save_event(t0, t1, kind="selection" if det is None else "detection",
+                             title=v["label"], tags=[v["label"]], notes=v["notes"],
+                             dets=[det] if det else None, open_editor=False)
+        self.events_panel.set_tag_suggestions(self.library.labels())
+        self.statusBar().showMessage(
+            f"Saved '{sig.label}' ({len(sig.positives)} example(s)). Later occurrences will be "
+            "flagged as suspected.", 8000)
+        return sig.label
+
+    def _speed(self) -> float:
+        return float(self.play_speed.currentText().rstrip("×"))
+
+    def _play_clip(self, clip, rate, t_start: float, filtered: bool | None = None) -> None:
+        clip = np.asarray(clip, dtype=float)
+        band = self.acoustics.band()
+        use_band = self.acoustics.band_listen.isChecked() if filtered is None else filtered
+        try:
+            if band is not None and use_band:
+                clip = filter_clip(clip, band, rate)
+            if self.denoise_on.isChecked():
+                clip = denoise(clip, rate)
+            self.player.gain = 10 ** (self.volume.value() / 20)
+            self.player.play(clip, rate, self._speed(), start_time=t_start)
+        except Exception as exc:
+            log.exception("playback failed")
+            QMessageBox.warning(self, APP_NAME, f"Playback failed:\n{exc}")
+
+    def play_selection(self) -> None:
+        sel = self._need_selection()
+        if sel is None:
+            return
+        got = self._clip(sel[0], sel[1], all_channels=True)
+        if got is not None:
+            self._play_clip(got[0][:, :2], got[1], got[2])
+
+    def stop_audio(self) -> None:
+        self.player.stop()
+        if self.act_listen.isChecked():
+            self.act_listen.blockSignals(True)
+            self.act_listen.setChecked(False)
+            self.act_listen.blockSignals(False)
+
+    def _set_listen(self, on: bool) -> None:
+        if not on:
+            self.player.stop()
+            return
+        if self.buffer is None or not self.buffer.sample_rate or not self.running:
+            QMessageBox.information(self, APP_NAME, "Live listening needs a running audio "
+                                    "(fixed sample rate) source.")
+            self.stop_audio()
+            return
+        a = self.analyzer
+        buf = self.buffer
+        if (a is not None and a.filtered is not None and self.acoustics.band() is not None
+                and self.acoustics.band_listen.isChecked()):
+            buf = a.filtered
+        try:
+            self.player.gain = 10 ** (self.volume.value() / 20)
+            self.player.follow(buf, self.buffer.sample_rate)
+        except Exception as exc:
+            log.exception("live listening failed")
+            QMessageBox.warning(self, APP_NAME, f"Can't open the audio output:\n{exc}")
+            self.stop_audio()
+
+    def save_selection_event(self) -> None:
+        sel = self._need_selection()
+        if sel is not None:
+            self._save_event(sel[0], sel[1], kind="selection")
+
+    # ======================================================================
+    # event capture
+    # ======================================================================
+    def _update_capture_text(self) -> None:
+        self.act_capture.setText(f"⏺ Capture last {self.pre_roll.value()} s")
+
+    def capture_event(self) -> None:
+        buf = self.buffer
+        if buf is None or not len(buf):
+            QMessageBox.information(self, APP_NAME, "Start a source first; the history buffer "
+                                    "is empty.")
+            return
+        t_press = buf.last_x()
+        pre, post = float(self.pre_roll.value()), float(self.post_roll.value())
+        if pre > buf.duration + 1 and buf.sample_rate:
+            self.statusBar().showMessage(f"Only {buf.duration:.0f} s of history available; "
+                                         "saving what there is.", 5000)
+        if post > 0:
+            self.statusBar().showMessage(f"Capturing… {post:g} s more", int(post * 1000))
+            QTimer.singleShot(int(post * 1000),
+                              lambda: self._save_event(t_press - pre, t_press + post, "capture"))
+        else:
+            self._save_event(t_press - pre, t_press, "capture")
+
+    def _save_event(self, t0: float, t1: float, kind: str, title: str = "",
+                    tags: list[str] | None = None, notes: str = "",
+                    dets: list[Detection] | None = None, open_editor: bool = True) -> None:
+        buf = self.buffer
+        if buf is None:
+            return
+        snap = buf.range(t0, t1)
+        if not len(snap):
+            QMessageBox.information(self, APP_NAME, "That time span is no longer in memory.")
+            return
+        if dets is None and self.analyzer is not None:
+            dets = [d for d in self.analyzer.all_detections() if d.t1 >= t0 and d.t0 <= t1]
+        det_info = [{"id": d.id, "t0": d.t0, "t1": d.t1, "text": d.text, "status": d.status,
+                     "label": d.label, "score": round(d.score, 3), "f_lo": d.f_lo,
+                     "f_hi": d.f_hi} for d in (dets or [])]
+        try:
+            rec = self.store.add(snap.x, snap.y, snap.names, buf.sample_rate, kind, title,
+                                 tags, notes, self._source_desc(),
+                                 self._wall_clock(float(snap.x[0])), det_info)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not save the event:\n{exc}")
+            return
+        self.events_panel.refresh(rec.id)
+        for d in dets or []:
+            d.saved_event = rec.id
+        self.statusBar().showMessage(f"Saved {rec.duration:.1f} s as event {rec.id}", 8000)
+        if open_editor:
+            self.review_tabs.setCurrentWidget(self.events_panel)
+            self.events_panel.focus_tags()
+
+    def play_event(self, rec) -> None:
+        try:
+            x, y, rate = self.store.load_clip(rec)
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, f"Can't read the clip:\n{exc}")
+            return
+        if not rate:
+            QMessageBox.information(self, APP_NAME, "This event is a data-stream clip (CSV), "
+                                    "not audio.")
+            return
+        self._play_clip(y[:, :2], rate, rec.t0, filtered=False)
+
+    def replay_event(self, rec) -> None:
+        if not rec.sample_rate:
+            QMessageBox.information(self, APP_NAME, "Only audio events can be replayed as a "
+                                    "source.")
+            return
+        self.stop()
+        self.select_source(self.file_panel.key)
+        self.file_panel.set_path(str(self.store.clip_path(rec)))
+        self.start()
+
+    # ======================================================================
+    # detections: review loop
+    # ======================================================================
+    def _refresh_detections(self) -> None:
+        a = self.analyzer
+        if a is None:
+            return
+        dets = a.all_detections()
+        newest = dets[-1].id if dets else 0
+        now = time.perf_counter()
+        if newest != self._last_det_id or now - self._det_table_t > 0.25:
+            self._last_det_id = newest
+            self._det_table_t = now
+            self.det_panel.update_detections(dets)
+        self.time_plot.update_detections(dets, self._selected_det)
+        if self.spectro.isVisible():
+            self.spectro.update_detections(dets, self._selected_det)
+
+    def _detection_selected(self, det_id: int) -> None:
+        self._selected_det = det_id
+
+    def _det(self, det_id: int) -> Detection | None:
+        return self.analyzer.detection(det_id) if self.analyzer else None
+
+    def _det_clip(self, det: Detection):
+        got = self.analyzer.detection_clip(det) if self.analyzer else None
+        if got is None:
+            QMessageBox.information(self, APP_NAME, "The audio for this detection is no longer "
+                                    "in memory.")
+        return got
+
+    def _review(self, action: str) -> None:
+        det_id = self.det_panel.current_id()
+        if det_id is not None:
+            {"confirm": self.confirm_detection, "reject": self.reject_detection}[action](det_id)
+
+    def confirm_detection(self, det_id: int) -> None:
+        det = self._det(det_id)
+        if det is None or det.status != "suspected":
+            return
+        got = self._det_clip(det)
+        sig = self.library.get(det.sig_id) if det.sig_id else None
+        if got is None or sig is None:
+            return
+        clip, rate, t_start = got
+        self.library.add_example(sig.label, clip, rate, det.f_lo, det.f_hi, "positive",
+                                 source=self._source_desc(),
+                                 floor=self.analyzer.floor_snapshot())
+        sig.confirmed += 1
+        self.library.update(sig)
+        self.analyzer.update_detection(det, status="confirmed")
+        if self.save_reviewed.isChecked():
+            self._save_event(det.t0 - 0.5, det.t1 + 0.5, "detection", sig.label, [sig.label],
+                             dets=[det], open_editor=False)
+
+    def correct_detection(self, det_id: int) -> None:
+        det = self._det(det_id)
+        if det is None:
+            return
+        got = self._det_clip(det)
+        if got is None:
+            return
+        clip, rate, t_start = got
+        new_label = ask_label(self, self.library.labels(), "Correct detection",
+                              "What is it really? (pick or type a new name)", det.label or "")
+        if not new_label:
+            return
+        floor = self.analyzer.floor_snapshot()
+        self.library.add_example(new_label, clip, rate, det.f_lo, det.f_hi, "positive",
+                                 source=self._source_desc(), floor=floor)
+        old = self.library.get(det.sig_id) if det.sig_id else None
+        if old is not None and old.label.lower() != new_label.lower():
+            self.library.add_example(old.label, clip, rate, det.f_lo, det.f_hi, "negative",
+                                     source=self._source_desc(), floor=floor)
+            old.rejected += 1
+            self.library.update(old)
+        new_sig = self.library.find(new_label)
+        self.analyzer.update_detection(det, status="corrected", label=new_label,
+                                       sig_id=new_sig.id if new_sig else None)
+        self.events_panel.set_tag_suggestions(self.library.labels())
+        if self.save_reviewed.isChecked():
+            self._save_event(det.t0 - 0.5, det.t1 + 0.5, "detection", new_label, [new_label],
+                             dets=[det], open_editor=False)
+
+    def reject_detection(self, det_id: int) -> None:
+        det = self._det(det_id)
+        if det is None or det.status not in ("suspected", "unidentified"):
+            return
+        sig = self.library.get(det.sig_id) if det.sig_id else None
+        if sig is not None:
+            got = self._det_clip(det)
+            if got is not None:
+                clip, rate, _ = got
+                self.library.add_example(sig.label, clip, rate, det.f_lo, det.f_hi, "negative",
+                                         source=self._source_desc(),
+                                         floor=self.analyzer.floor_snapshot())
+                sig.rejected += 1
+                self.library.update(sig)
+        self.analyzer.update_detection(det, status="rejected")
+
+    def identify_detection(self, det_id: int) -> None:
+        det = self._det(det_id)
+        if det is None:
+            return
+        got = self._det_clip(det)
+        if got is None:
+            return
+        clip, rate, t_start = got
+        suggested = det.label or (det.alternatives[0][1] if det.alternatives else "")
+        floor = self.analyzer.floor_snapshot()
+        lo, hi = (det.f_lo, det.f_hi) if det.f_hi > det.f_lo else estimate_band(
+            clip, rate, *(floor or (None, None)))
+        old_label = det.label
+        label = self._identify(clip, rate, lo, hi, suggested, det.t0, det.t1, floor, det)
+        if label is None:
+            return
+        old = self.library.get(det.sig_id) if det.sig_id else None
+        if old is not None and old_label and old_label.lower() != label.lower():
+            self.library.add_example(old.label, clip, rate, det.f_lo, det.f_hi, "negative",
+                                     source=self._source_desc(), floor=floor)
+            old.rejected += 1
+            self.library.update(old)
+            status = "corrected"
+        else:
+            status = "confirmed"
+        sig = self.library.find(label)
+        self.analyzer.update_detection(det, status=status, label=label,
+                                       sig_id=sig.id if sig else None)
+
+    def play_detection(self, det_id: int) -> None:
+        det = self._det(det_id)
+        if det is None:
+            return
+        got = self._det_clip(det)
+        if got is not None:
+            self._play_clip(*got)
+
+    def show_detection(self, det_id: int) -> None:
+        det = self._det(det_id)
+        if det is None:
+            return
+        self._selected_det = det_id
+        self._enter_explore()
+        pad = max(0.5, det.t1 - det.t0)
+        self.time_plot.setXRange(det.t0 - pad, det.t1 + pad, padding=0)
+        self._explore_pending = True
+
+    def save_detection_event(self, det_id: int) -> None:
+        det = self._det(det_id)
+        if det is not None:
+            tags = [det.label] if det.label else []
+            self._save_event(det.t0 - 0.5, det.t1 + 0.5, "detection", det.label or "", tags,
+                             dets=[det])
+
+    def manage_signatures(self) -> None:
+        dlg = SignatureManager(self, self.library,
+                               play_example=lambda clip, rate: self._play_clip(clip, rate, 0.0,
+                                                                               filtered=False),
+                               default_threshold=self.acoustics.match_thr.value())
+        dlg.exec()
+        self.events_panel.set_tag_suggestions(self.library.labels())
 
     # ======================================================================
     # reactions to controls
@@ -484,6 +1380,7 @@ class MainWindow(QMainWindow):
             self.stop()
         self.stack.setCurrentIndex(idx)
         self.preview.setVisible(self.current_panel() is self.screen_panel)
+        self.transport.setVisible(self.current_panel() is self.file_panel)
         self._update_outline()
         self._update_axis_label()
 
@@ -498,14 +1395,31 @@ class MainWindow(QMainWindow):
         self.time_plot.trigger_line.setVisible(trig)
         self.time_plot.trigger_line.setValue(self.trig_level.value())
         self.y_row.setEnabled(not self.y_auto.isChecked())
-        spec = self.spectrum_on.isChecked()
-        for w in (self.fft_size, self.fft_log, self.fft_avg):
-            f.setRowVisible(w, spec)
-        self.spec_plot.setVisible(spec)
+        self.spectro.setVisible(self.spectro_on.isChecked())
+        self.spectro.set_colormap(self.cmap.currentData())
+        self.db_range.setEnabled(not self.spec_snr.isChecked())
+        self.spec_plot.setVisible(self.spectrum_on.isChecked())
         self.spec_plot.setLogMode(x=self.fft_log.isChecked(), y=False)
+        self.levels_plot.setVisible(self.levels_on.isChecked())
+        self.overview.setVisible(self.overview_on.isChecked())
         self._update_axis_label()
-        self._last_version = -1  # redraw with the new settings
+        self._last_version = -1
+        self._explore_pending = True
         self._apply_y_range()
+
+    def _acoustics_changed(self) -> None:
+        if self.analyzer is not None:
+            self.analyzer.apply(self.acoustics.settings())
+        self._last_version = -1
+        self._explore_pending = True
+
+    def _band_from_selection(self) -> None:
+        band = self.spectro.selected_band()
+        if band is None:
+            QMessageBox.information(self, APP_NAME, "Shift-drag a box on the spectrogram "
+                                    "first, then click this button.")
+            return
+        self.acoustics.set_band(*band, "bandpass")
 
     def _update_axis_label(self) -> None:
         src = self.source
@@ -515,6 +1429,8 @@ class MainWindow(QMainWindow):
             self.time_plot.setLabel("bottom", "Sample", units="")
         elif self.mode.currentData() == "trigger":
             self.time_plot.setLabel("bottom", "Time from trigger", units="s")
+        elif isinstance(src, AudioFileSource):
+            self.time_plot.setLabel("bottom", "File time", units="s")
         else:
             self.time_plot.setLabel("bottom", "Time", units="s")
 
@@ -525,13 +1441,39 @@ class MainWindow(QMainWindow):
         line.blockSignals(False)
         self._last_version = -1
 
-    def _set_paused(self, paused: bool) -> None:
-        self.paused = paused
-        self.pause_btn.setText("▶  Resume" if paused else "⏸  Pause")
+    # -- file transport ------------------------------------------------------------
+    def open_audio_file(self) -> None:
+        from aquafonix.audiofile import OPEN_FILTER
 
-    # ======================================================================
-    # screen region
-    # ======================================================================
+        path, _ = QFileDialog.getOpenFileName(self, "Open recording", self._last_dir, OPEN_FILTER)
+        if not path:
+            return
+        self._last_dir = str(Path(path).parent)
+        self.stop()
+        self.select_source(self.file_panel.key)
+        self.file_panel.set_path(path)
+        self.start()
+
+    def _transport_toggle(self) -> None:
+        src = self.source
+        if isinstance(src, AudioFileSource) and src.running:
+            src.set_paused(not (src.paused or src.finished))
+        elif self.current_panel() is self.file_panel:
+            self.start()
+
+    def _transport_seek(self) -> None:
+        self._seeking = False
+        src = self.source
+        if isinstance(src, AudioFileSource):
+            src.seek(self.tr_slider.value() / 10000 * src.duration)
+            self._reset_view()
+
+    def _transport_speed(self) -> None:
+        src = self.source
+        if isinstance(src, AudioFileSource):
+            src.set_speed(float(self.tr_speed.currentData()))
+
+    # -- screen region -------------------------------------------------------------
     def _select_region(self) -> None:
         self.outline.hide()
         self.hide()
@@ -562,9 +1504,10 @@ class MainWindow(QMainWindow):
     def _screen_settings_changed(self) -> None:
         src = self.source
         if isinstance(src, ScreenSource) and src.running:
-            old_output = src.output
+            old = (src.output, tuple(d.name for d in src.settings.traces), src.settings.mode)
             self.screen_panel.apply_to(src)
-            if src.output != old_output:
+            new = (src.output, tuple(d.name for d in src.settings.traces), src.settings.mode)
+            if new != old:  # channels change: start the history afresh
                 self.clear()
         self._update_outline()
         self._update_axis_label()
@@ -581,7 +1524,21 @@ class MainWindow(QMainWindow):
         c0, c1 = max(0, col - 3), min(img.shape[1], col + 4)
         patch = img[r0:r1, c0:c1].reshape(-1, 3).astype(int)
         dist = ((patch - np.array(frame.result.background)) ** 2).sum(axis=1)
-        sp.set_picked_color(tuple(int(v) for v in patch[int(np.argmax(dist))]))
+        sp.add_picked_trace(tuple(int(v) for v in patch[int(np.argmax(dist))]))
+
+    def _autodetect_traces(self, count: int) -> None:
+        frame = self._last_frame
+        if frame is None:
+            QMessageBox.information(self, APP_NAME, "Start watching the region first, then "
+                                    "auto-detect its lines.")
+            return
+        st = self.screen_panel.trace_settings()
+        colors = auto_trace_colors(frame.image, frame.result.background, st.tolerance, count,
+                                   st.ignore_grid)
+        if not colors:
+            QMessageBox.information(self, APP_NAME, "No lines found; try a lower tolerance.")
+            return
+        self.screen_panel.set_detected_traces(colors)
 
     def _save_trace(self) -> None:
         frame = self._last_frame
@@ -592,9 +1549,10 @@ class MainWindow(QMainWindow):
         if not path:
             return
         r = frame.result
-        data = np.column_stack([r.x, r.y, r.x_px, r.y_px])
-        np.savetxt(path, data, delimiter=",", fmt="%.10g", comments="",
-                   header="x,y,x_px,y_px")
+        cols = [r.x, *[t.y for t in r.traces], r.x_px, *[t.y_px for t in r.traces]]
+        header = ["x", *r.names, "x_px", *[f"{n}_px" for n in r.names]]
+        np.savetxt(path, np.column_stack(cols), delimiter=",", fmt="%.10g", comments="",
+                   header=",".join(header))
 
     # ======================================================================
     # recording / export
@@ -673,6 +1631,24 @@ class MainWindow(QMainWindow):
         if path:
             self.plots.grab().save(path)
 
+    def _choose_data_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Data folder (signatures and events)",
+                                                str(self.data_dir))
+        if not path:
+            return
+        self.data_dir = Path(path)
+        self.data_label.setText(path)
+        self.library = SignatureLibrary(self.data_dir / "signatures")
+        self.matcher.library = self.library
+        self.matcher._key = None
+        self.store = EventStore(self.data_dir / "events")
+        self.events_panel.set_store(self.store)
+        self.events_panel.set_tag_suggestions(self.library.labels())
+
+    def _open_folder(self, path: Path) -> None:
+        Path(path).mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
     # ======================================================================
     # settings
     # ======================================================================
@@ -681,11 +1657,12 @@ class MainWindow(QMainWindow):
         geometry = s.value("window/geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
-        for key, split in (("window/main_split", self.main_split),
-                           ("window/plot_split", self.plot_split)):
-            state = s.value(key)
-            if state is not None:
-                split.restoreState(state)
+        state = s.value("window/state")
+        if state is not None:
+            self.restoreState(state)
+        split = s.value("window/plot_split")
+        if split is not None:
+            self.plot_split.restoreState(split)
         self._last_dir = str(s.value("window/last_dir", self._last_dir))
         s.beginGroup("controls")
         restore_state(self, s)
@@ -698,9 +1675,10 @@ class MainWindow(QMainWindow):
     def save_settings(self) -> None:
         s = self.settings
         s.setValue("window/geometry", self.saveGeometry())
-        s.setValue("window/main_split", self.main_split.saveState())
+        s.setValue("window/state", self.saveState())
         s.setValue("window/plot_split", self.plot_split.saveState())
         s.setValue("window/last_dir", self._last_dir)
+        s.setValue("data/dir", str(self.data_dir))
         s.beginGroup("controls")
         save_state(self, s)
         s.endGroup()
@@ -711,8 +1689,11 @@ class MainWindow(QMainWindow):
         self._update_outline()
 
     def closeEvent(self, event) -> None:
+        self.player.stop()
         self.stop()
+        self._stop_analyzer()
         self.outline.close()
         if self.persist:
             self.save_settings()
         super().closeEvent(event)
+

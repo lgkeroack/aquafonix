@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider,
-                               QToolButton, QVBoxLayout, QWidget)
+                               QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton,
+                               QSlider, QTableWidget, QTableWidgetItem, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from aquafonix.parsing import BINARY_TYPES, ParserConfig
 from aquafonix.screen.capture import OUTPUTS, Region, ScreenSource
-from aquafonix.screen.extract import ESTIMATORS, MODES, PROBES, Calibration, TraceSettings
+from aquafonix.screen.extract import (ESTIMATORS, MAX_TRACES, MODES, PROBES, Calibration,
+                                      TraceDef, TraceSettings)
 from aquafonix.sources import (FileTailSource, GeneratorSource, SerialSource, Source,
                                TcpClientSource, TcpServerSource, UdpSource, list_serial_ports)
 from aquafonix.sources.audio import AudioSource, list_audio_devices
@@ -164,6 +167,66 @@ class AudioPanel(SourcePanel):
         return AudioSource(self._devices[idx], rate, self.channels.value())
 
 
+class AudioFilePanel(SourcePanel):
+    key, title = "audiofile", "Audio file (replay a recording)"
+    SPEEDS = {"0": "Scan (as fast as possible)", "0.1": "0.1×", "0.25": "0.25×", "0.5": "0.5×",
+              "1": "1× (real time)", "2": "2×", "4": "4×", "8": "8×", "16": "16×"}
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        f = self.form()
+        row = QHBoxLayout()
+        self.path = named(QLineEdit(), "audiofile.path")
+        self.path.setPlaceholderText("WAV / FLAC / AIFF hydrophone recording")
+        self.path.editingFinished.connect(self._update_info)
+        browse = QToolButton(text="…", toolTip="Browse")
+        browse.clicked.connect(self._browse)
+        row.addWidget(self.path, 1)
+        row.addWidget(browse)
+        f.addRow("File", row)
+        self.info = QLabel("")
+        f.addRow("", self.info)
+        self.speed = named(combo(self.SPEEDS, "1"), "audiofile.speed")
+        f.addRow("Speed", self.speed)
+        self.loop = named(QCheckBox("Loop"), "audiofile.loop")
+        f.addRow(self.loop)
+        self.layout_.addWidget(_hint(
+            "Replays the file through everything else (spectrogram, detection, events). "
+            "Use the transport bar above the plots to pause, seek or change speed. "
+            "<b>Scan</b> runs detection over the whole file as fast as possible."))
+
+    def _browse(self) -> None:
+        from aquafonix.audiofile import OPEN_FILTER
+
+        path, _ = QFileDialog.getOpenFileName(self, "Open recording", self.path.text(),
+                                              OPEN_FILTER)
+        if path:
+            self.set_path(path)
+
+    def set_path(self, path: str) -> None:
+        self.path.setText(path)
+        self._update_info()
+
+    def _update_info(self) -> None:
+        from aquafonix import audiofile
+
+        path = self.path.text().strip()
+        if not path:
+            self.info.setText("")
+            return
+        try:
+            i = audiofile.info(path)
+            self.info.setText(f"{i.duration:.1f} s · {i.sample_rate:g} Hz · {i.channels} ch")
+        except Exception as exc:
+            self.info.setText(f"can't read: {exc}")
+
+    def create_source(self) -> Source:
+        from aquafonix.sources.audiofile import AudioFileSource
+
+        return AudioFileSource(self.path.text().strip(), float(self.speed.currentData()),
+                               self.loop.isChecked())
+
+
 class SerialPanel(SourcePanel):
     key, title = "serial", "Serial port (COM)"
     BAUDS = ["9600", "19200", "38400", "57600", "115200", "230400", "250000", "460800",
@@ -309,6 +372,7 @@ class ScreenPanel(SourcePanel):
     key, title = "screen", "Screen region (graph on screen)"
     select_requested = Signal()
     save_trace_requested = Signal()
+    autodetect_requested = Signal(int)
     region_changed = Signal(object)
     #: (key, pixel position) for a calibration line edited in the panel
     cal_line_changed = Signal(str, float)
@@ -346,17 +410,39 @@ class ScreenPanel(SourcePanel):
         # detection
         f = self.form("Line detection")
         self.mode = named(combo(MODES, "auto"), "screen.mode")
-        f.addRow("Find line by", self.mode)
+        f.addRow("Find lines by", self.mode)
+        self.traces = QTableWidget(0, 3)
+        self.traces.setHorizontalHeaderLabels(["Trace name", "Colour", ""])
+        self.traces.verticalHeader().setVisible(False)
+        hh = self.traces.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.traces.setMinimumHeight(110)
+        self.traces.itemChanged.connect(self._traces_edited)
+        f.addRow(self.traces)
         crow = QHBoxLayout()
-        self.color = named(ColorButton((255, 0, 0)), "screen.color")
-        self.pick = QPushButton("Pick from preview")
+        self.pick = QPushButton("+ Pick from preview")
         self.pick.setCheckable(True)
-        self.pick.setToolTip("Then click the line in the preview image")
-        crow.addWidget(self.color)
+        self.pick.setToolTip("Then click a line in the preview image to add it as a trace")
+        self.auto_n = named(spin(1, MAX_TRACES, 2), "screen.autocount")
+        self.auto_n.setToolTip("How many differently coloured lines to look for")
+        auto = QPushButton("Auto-detect")
+        auto.setToolTip("Find the most prominent line colours in the current frame")
+        auto.clicked.connect(lambda: self.autodetect_requested.emit(self.auto_n.value()))
         crow.addWidget(self.pick, 1)
-        f.addRow("Colour", crow)
+        crow.addWidget(auto)
+        crow.addWidget(self.auto_n)
+        f.addRow(crow)
+        self._traces_state = named(QLineEdit(), "screen.traces")  # persisted, not shown
+        self._traces_state.setVisible(False)
+        self._traces_state.textChanged.connect(self._load_traces_state)
+        self.layout_.addWidget(self._traces_state)
         self.detected = QLabel("–")
-        f.addRow("Matched", self.detected)
+        self.detected.setWordWrap(True)
+        self.detected.setTextFormat(Qt.RichText)
+        f.addRow("Found", self.detected)
+        self._det_form = f
         trow = QHBoxLayout()
         self.tolerance = named(QSlider(Qt.Horizontal), "screen.tolerance")
         self.tolerance.setRange(5, 250)
@@ -420,7 +506,6 @@ class ScreenPanel(SourcePanel):
         for w in (self.fps, self.probe_col, *self.cal_val.values()):
             w.valueChanged.connect(self._changed)
         self.tolerance.valueChanged.connect(self._changed)
-        self.color.colorChanged.connect(self._changed)
         self.layout_.addStretch(1)
         self._building = False
         self._update_visibility()
@@ -461,30 +546,95 @@ class ScreenPanel(SourcePanel):
                            p["xa"].value(), v["xa"].value(), p["xb"].value(), v["xb"].value(),
                            self.log_y.isChecked())
 
+    def trace_defs(self) -> list[TraceDef]:
+        defs = []
+        for row in range(self.traces.rowCount()):
+            item = self.traces.item(row, 0)
+            button = self.traces.cellWidget(row, 1)
+            name = (item.text().strip() if item else "") or f"trace {row + 1}"
+            defs.append(TraceDef(name, button.color()))
+        return defs
+
+    def set_trace_defs(self, defs: list[TraceDef]) -> None:
+        self.traces.blockSignals(True)
+        self.traces.setRowCount(0)
+        names = set()
+        for d in defs[:MAX_TRACES]:
+            name = d.name
+            while name in names:  # channel names must be unique
+                name += "'"
+            names.add(name)
+            row = self.traces.rowCount()
+            self.traces.insertRow(row)
+            self.traces.setItem(row, 0, QTableWidgetItem(name))
+            button = ColorButton(d.color)
+            button.colorChanged.connect(self._traces_edited)
+            self.traces.setCellWidget(row, 1, button)
+            remove = QToolButton(text="✕", toolTip="Remove this trace")
+            remove.clicked.connect(lambda _=False, b=button: self._remove_trace(b))
+            self.traces.setCellWidget(row, 2, remove)
+        self.traces.blockSignals(False)
+        self._traces_edited()
+
+    def _remove_trace(self, button) -> None:
+        for row in range(self.traces.rowCount()):
+            if self.traces.cellWidget(row, 1) is button:
+                defs = self.trace_defs()
+                del defs[row]
+                self.set_trace_defs(defs)
+                return
+
+    def _traces_edited(self, *_args) -> None:
+        state = ";".join(f"{d.name.replace(';', ',').replace('=', '-')}="
+                         f"#{d.color[0]:02x}{d.color[1]:02x}{d.color[2]:02x}"
+                         for d in self.trace_defs())
+        self._traces_state.blockSignals(True)
+        self._traces_state.setText(state)
+        self._traces_state.blockSignals(False)
+        self._changed()
+
+    def _load_traces_state(self, text: str) -> None:
+        defs = []
+        for part in text.split(";"):
+            name, _, color = part.rpartition("=")
+            c = QColor(color)
+            if name and c.isValid():
+                defs.append(TraceDef(name, (c.red(), c.green(), c.blue())))
+        self.set_trace_defs(defs)
+
     def trace_settings(self) -> TraceSettings:
-        return TraceSettings(mode=self.mode.currentData(), color=self.color.color(),
+        return TraceSettings(mode=self.mode.currentData(), traces=tuple(self.trace_defs()),
                              tolerance=float(self.tolerance.value()),
                              ignore_grid=self.ignore_grid.isChecked(),
                              estimator=self.estimator.currentData(),
                              bridge_gaps=self.bridge.isChecked(),
                              calibration=self.calibration())
 
-    def set_picked_color(self, rgb) -> None:
+    def add_picked_trace(self, rgb) -> None:
+        """A colour clicked in the preview becomes a new trace."""
         self.pick.setChecked(False)
-        self.color.setColor(rgb)
-        self.mode.setCurrentIndex(self.mode.findData("color"))
-
-    def show_detected(self, rgb, background) -> None:
-        if rgb is None:
-            self.detected.setText("no line found")
-            self.detected.setStyleSheet("")
+        defs = self.trace_defs()
+        if len(defs) >= MAX_TRACES:
             return
-        r, g, b = rgb
-        self.detected.setText(f"  #{r:02x}{g:02x}{b:02x}  ")
-        bg = background or (0, 0, 0)
-        self.detected.setStyleSheet(
-            f"background: rgb({bg[0]},{bg[1]},{bg[2]}); color: rgb({r},{g},{b});"
-            "font-weight: bold; border: 1px solid #888;")
+        defs.append(TraceDef(f"trace {len(defs) + 1}", tuple(int(v) for v in rgb)))
+        self.set_trace_defs(defs)
+        self.mode.setCurrentIndex(self.mode.findData("colors"))
+
+    def set_detected_traces(self, colors) -> None:
+        """Replace the trace list with auto-detected colours."""
+        self.set_trace_defs([TraceDef(f"trace {i + 1}", c) for i, c in enumerate(colors)])
+        self.mode.setCurrentIndex(self.mode.findData("colors"))
+
+    def show_detected(self, result) -> None:
+        parts = []
+        for i, tr in enumerate(result.traces):
+            if tr.color is None:
+                parts.append(f"{tr.name}: {tr.coverage:.0%}")
+                continue
+            r, g, b = tr.color
+            parts.append(f'<span style="color:rgb({r},{g},{b})">■</span> {tr.name}: '
+                         f"{tr.coverage:.0%}")
+        self.detected.setText("<br>".join(parts) if parts else "no line found")
 
     # -- source ---------------------------------------------------------------
     def create_source(self) -> Source:
@@ -527,7 +677,8 @@ class ScreenPanel(SourcePanel):
     def _update_visibility(self) -> None:
         self._out_form.setRowVisible(self.probe_col, self.probe.currentData() == "column")
         self._out_form.setRowVisible(self.probe, self.output.currentData() != "stitch")
-        self.color.setEnabled(self.mode.currentData() == "color")
+        self.traces.setEnabled(self.mode.currentData() == "colors")
 
 
-PANELS = (AudioPanel, SerialPanel, NetworkPanel, FilePanel, ScreenPanel, GeneratorPanel)
+PANELS = (AudioPanel, AudioFilePanel, SerialPanel, NetworkPanel, FilePanel, ScreenPanel,
+          GeneratorPanel)

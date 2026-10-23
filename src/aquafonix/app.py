@@ -149,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     from aquafonix.screen.capture import Region
     from aquafonix.ui.main_window import MainWindow
 
-    win = MainWindow(QSettings(str(ini), QSettings.IniFormat))
+    win = MainWindow(QSettings(str(ini), QSettings.IniFormat), ini.parent / f"{APP_NAME}Data")
     try:
         if args.source:
             win.select_source(args.source)

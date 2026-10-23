@@ -14,10 +14,11 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
 MODES = {
-    "auto": "Auto (most prominent colour)",
-    "color": "Picked colour",
-    "contrast": "Anything unlike the background",
+    "auto": "Auto (single, most prominent line)",
+    "colors": "Line colours (one or more traces)",
+    "contrast": "Anything unlike the background (single)",
 }
+MAX_TRACES = 8
 ESTIMATORS = {
     "center": "Centre of line",
     "top": "Top edge (upper envelope)",
@@ -74,9 +75,17 @@ class Calibration:
 
 
 @dataclass(frozen=True)
+class TraceDef:
+    """One line to follow: a name (becomes the channel name) and its colour."""
+
+    name: str
+    color: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
 class TraceSettings:
     mode: str = "auto"
-    color: tuple[int, int, int] = (255, 0, 0)
+    traces: tuple[TraceDef, ...] = ()  # used in "colors" mode
     tolerance: float = 60.0
     ignore_grid: bool = True
     estimator: str = "center"
@@ -85,15 +94,49 @@ class TraceSettings:
 
 
 @dataclass
-class TraceResult:
-    x_px: np.ndarray  # (W,) column centres
-    y_px: np.ndarray  # (W,) line position per column, NaN where none
-    x: np.ndarray  # calibrated
-    y: np.ndarray  # calibrated
-    mask: np.ndarray  # (H, W) bool, pixels classified as trace
+class Trace:
+    name: str
     color: tuple[int, int, int] | None  # colour that was matched
-    background: tuple[int, int, int]
+    y_px: np.ndarray  # (W,) line position per column, NaN where none
+    y: np.ndarray  # calibrated
+    mask: np.ndarray  # (H, W) bool, pixels classified as this trace
     coverage: float  # fraction of columns where the line was found
+
+
+@dataclass
+class FrameTraces:
+    """All traces extracted from one captured frame."""
+
+    x_px: np.ndarray  # (W,) column centres
+    x: np.ndarray  # calibrated
+    traces: list[Trace]
+    background: tuple[int, int, int]
+
+    @property
+    def names(self) -> list[str]:
+        return [t.name for t in self.traces]
+
+    @property
+    def y(self) -> np.ndarray:
+        """Calibrated values, shape (W, traces)."""
+        if not self.traces:
+            return np.zeros((len(self.x_px), 0))
+        return np.column_stack([t.y for t in self.traces])
+
+    @property
+    def mask(self) -> np.ndarray:
+        out = np.zeros(self.traces[0].mask.shape, dtype=bool) if self.traces else None
+        for t in self.traces:
+            out |= t.mask
+        return out
+
+    @property
+    def coverage(self) -> float:
+        return max((t.coverage for t in self.traces), default=0.0)
+
+    def reference(self) -> Trace | None:
+        """The best-covered trace (used to measure scrolling)."""
+        return max(self.traces, key=lambda t: t.coverage, default=None)
 
 
 # -- pixel classification -------------------------------------------------------
@@ -144,47 +187,63 @@ def suppress_grid(mask: np.ndarray, img: np.ndarray, frac: float = 0.4,
     return mask & ~(kill & neutral)
 
 
-def auto_trace_color(img: np.ndarray, background, tolerance: float,
-                     ignore_grid: bool = True,
-                     neutral: np.ndarray | None = None) -> tuple[int, int, int] | None:
-    """Pick the trace colour: the most common non-background colour, with
-    saturated colours strongly preferred over greys (grid, text)."""
+def auto_trace_colors(img: np.ndarray, background, tolerance: float, count: int = 1,
+                      ignore_grid: bool = True,
+                      neutral: np.ndarray | None = None) -> list[tuple[int, int, int]]:
+    """The ``count`` most prominent, mutually distinct non-background
+    colours; saturated colours are strongly preferred over greys (grid, text)."""
     fg = color_distance_sq(img, background) > tolerance**2
     if ignore_grid:
         fg = suppress_grid(fg, img, neutral=neutral)
     px = img[fg]
     if not len(px):
-        return None
+        return []
     if len(px) > 200_000:
         px = px[:: len(px) // 200_000 + 1]
     c = chroma(px[None])[0]
     q = (px >> 4).astype(np.int32)
     key = (q[:, 0] << 8) | (q[:, 1] << 4) | q[:, 2]
     score = np.bincount(key, weights=0.15 + c / 255.0, minlength=4096)
-    best = score.argmax()
-    return tuple(int(v) for v in px[key == best].mean(axis=0).round())
+    colors: list[tuple[int, int, int]] = []
+    for best in np.argsort(score)[::-1]:
+        if score[best] <= 0 or len(colors) >= count:
+            break
+        color = px[key == best].mean(axis=0)
+        if all(np.sum((color - np.array(prev)) ** 2) > tolerance**2 for prev in colors):
+            colors.append(tuple(int(v) for v in color.round()))
+    return colors
 
 
-def trace_mask(img: np.ndarray, settings: TraceSettings):
-    """Returns ``(mask, matched_colour, background)``."""
+def auto_trace_color(img: np.ndarray, background, tolerance: float, ignore_grid: bool = True,
+                     neutral: np.ndarray | None = None) -> tuple[int, int, int] | None:
+    found = auto_trace_colors(img, background, tolerance, 1, ignore_grid, neutral)
+    return found[0] if found else None
+
+
+def trace_masks(img: np.ndarray, settings: TraceSettings):
+    """Returns ``([(name, colour, mask)], background)``.  With several
+    colours each pixel goes to the nearest one, so traces don't share pixels."""
     bg = background_color(img)
     tol2 = float(settings.tolerance) ** 2
     neutral = neutral_pixels(img) if settings.ignore_grid else None
-    color = None
+    out = []
     if settings.mode == "contrast":
-        mask = color_distance_sq(img, bg) > tol2
+        out.append(("trace", None, color_distance_sq(img, bg) > tol2))
+    elif settings.mode == "colors" and settings.traces:
+        defs = settings.traces[:MAX_TRACES]
+        dist = np.stack([color_distance_sq(img, t.color) for t in defs])
+        nearest = np.argmin(dist, axis=0)
+        for i, t in enumerate(defs):
+            out.append((t.name, tuple(int(v) for v in t.color),
+                        (dist[i] <= tol2) & (nearest == i)))
     else:
-        if settings.mode == "color":
-            color = tuple(int(v) for v in settings.color)
-        else:
-            color = auto_trace_color(img, bg, settings.tolerance, settings.ignore_grid, neutral)
-        if color is None:
-            mask = np.zeros(img.shape[:2], dtype=bool)
-        else:
-            mask = color_distance_sq(img, color) <= tol2
+        color = auto_trace_color(img, bg, settings.tolerance, settings.ignore_grid, neutral)
+        mask = (color_distance_sq(img, color) <= tol2 if color is not None
+                else np.zeros(img.shape[:2], dtype=bool))
+        out.append(("trace", color, mask))
     if settings.ignore_grid:
-        mask = suppress_grid(mask, img, neutral=neutral)
-    return mask, color, tuple(int(v) for v in bg.round())
+        out = [(n, c, suppress_grid(m, img, neutral=neutral)) for n, c, m in out]
+    return out, tuple(int(v) for v in bg.round())
 
 
 # -- line position per column ---------------------------------------------------
@@ -243,19 +302,21 @@ def bridge_gaps(y: np.ndarray) -> np.ndarray:
     return out
 
 
-def extract_trace(img: np.ndarray, settings: TraceSettings | None = None) -> TraceResult:
+def extract_traces(img: np.ndarray, settings: TraceSettings | None = None) -> FrameTraces:
     settings = settings or TraceSettings()
     img = np.ascontiguousarray(img[..., :3])
     h, w = img.shape[:2]
-    mask, color, bg = trace_mask(img, settings)
-    y_px = column_positions(mask, settings.estimator)
-    coverage = float(np.isfinite(y_px).mean()) if w else 0.0
-    if settings.bridge_gaps:
-        y_px = bridge_gaps(y_px)
-    x_px = np.arange(w, dtype=float) + 0.5
+    masks, bg = trace_masks(img, settings)
     cal = settings.calibration or Calibration.for_size(w, h)
-    return TraceResult(x_px, y_px, cal.x_value(x_px), cal.y_value(y_px), mask, color, bg,
-                       coverage)
+    x_px = np.arange(w, dtype=float) + 0.5
+    traces = []
+    for name, color, mask in masks:
+        y_px = column_positions(mask, settings.estimator)
+        coverage = float(np.isfinite(y_px).mean()) if w else 0.0
+        if settings.bridge_gaps:
+            y_px = bridge_gaps(y_px)
+        traces.append(Trace(name, color, y_px, cal.y_value(y_px), mask, coverage))
+    return FrameTraces(x_px, cal.x_value(x_px), traces, bg)
 
 
 def probe_value(values: np.ndarray, probe: str = "right", column_frac: float = 0.5) -> float:
@@ -322,11 +383,13 @@ class ScrollStitcher:
         self.resyncs = 0
 
     def update(self, y_px: np.ndarray, values: np.ndarray, t: float):
-        """Feed one frame; returns ``(times, values)`` of new columns."""
+        """Feed one frame: ``y_px`` (W,) of the reference trace, ``values``
+        (W,) or (W, traces).  Returns ``(times, values)`` of new columns."""
         empty = (np.zeros(0), np.zeros(0))
         y_px = np.asarray(y_px, dtype=float)
         values = np.asarray(values, dtype=float)
-        if self._prev_px is None or len(self._prev_px) != len(y_px):
+        if (self._prev_px is None or len(self._prev_px) != len(y_px)
+                or self._prev_val.shape[1:] != values.shape[1:]):
             self.reset()
             self._prev_px, self._prev_val, self._prev_t = y_px, values, t
             self._last_shift_t = t

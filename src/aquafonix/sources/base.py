@@ -26,10 +26,13 @@ class Source:
     """Base class.  Loop-driven subclasses implement :meth:`_step`; callback
     driven ones (audio) override :meth:`_begin` / :meth:`_end` instead."""
 
-    #: nominal sample rate in Hz when the source has one (audio, generator)
+    #: nominal sample rate in Hz when the source has one (audio, generator).
+    #: Such sources produce x = sample_index / sample_rate.
     sample_rate: float | None = None
     #: suggested ring-buffer capacity in samples
     buffer_capacity: int = 500_000
+    #: storage type for the history buffer (audio uses float32)
+    sample_dtype = np.float64
 
     def __init__(self) -> None:
         self.buffer: RingBuffer | None = None
