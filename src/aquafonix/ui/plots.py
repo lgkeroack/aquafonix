@@ -95,9 +95,10 @@ class _MultiCurvePlot(pg.PlotWidget):
 class _DetectionOverlay:
     """Shaded spans / boxes with labels for detections on a plot."""
 
-    def __init__(self, plot: pg.PlotWidget, boxes: bool) -> None:
+    def __init__(self, plot: pg.PlotWidget, boxes: bool, fy=None) -> None:
         self.plot = plot
         self.boxes = boxes
+        self.fy = fy or (lambda f: f)
         self.items: dict[int, tuple] = {}
 
     def update(self, detections, x_range, y_top: float, selected: int | None = None) -> None:
@@ -129,12 +130,13 @@ class _DetectionOverlay:
                 items = self.items[det.id] = (shape, label)
             shape, label = items
             if self.boxes:
-                shape.setRect(QRectF(det.t0, det.f_lo, det.t1 - det.t0, max(det.f_hi - det.f_lo, 1)))
+                y0, y1 = self.fy(det.f_lo), self.fy(det.f_hi)
+                shape.setRect(QRectF(det.t0, y0, det.t1 - det.t0, max(y1 - y0, 1e-6)))
                 pen = QPen(QColor(r, g, b, 230), pen_w)
                 pen.setCosmetic(True)
                 shape.setPen(pen)
                 shape.setBrush(QColor(r, g, b, alpha // 3))
-                label.setPos(det.t0, det.f_hi)
+                label.setPos(det.t0, y1)
             else:
                 shape.setRegion((det.t0, det.t1))
                 shape.setBrush(pg.mkBrush(r, g, b, alpha))
@@ -224,9 +226,17 @@ class OverviewPlot(pg.PlotWidget):
             self.region_dragged.emit(*self.region.getRegion())
 
 
+def colormap(name: str) -> pg.ColorMap:
+    anchors = np.array(COLORMAPS.get(name, COLORMAPS["inferno"]), dtype=np.ubyte)
+    return pg.ColorMap(np.linspace(0, 1, len(anchors)), anchors)
+
+
 class SpectrogramView(pg.PlotWidget):
-    """Scrolling spectrogram (time x frequency) with detection boxes, the
-    filter band and a time-frequency selection box."""
+    """Scrolling spectrogram (time x frequency) with an interactive colour
+    bar, linear or logarithmic frequency axis, detection boxes, the filter
+    band and a time-frequency selection box."""
+
+    levels_dragged = Signal(float, float)
 
     def __init__(self, parent=None) -> None:
         self.vb = SelectViewBox()
@@ -235,7 +245,11 @@ class SpectrogramView(pg.PlotWidget):
         self.setLabel("bottom", "Time", units="s")
         self.image = pg.ImageItem(axisOrder="row-major")
         self.addItem(self.image)
-        self.set_colormap("inferno")
+        self.cbar = pg.ColorBarItem(values=(0, 1), colorMap=colormap("inferno"),
+                                    interactive=True, width=14, label="dB")
+        self.cbar.setImageItem(self.image, insert_in=self.getPlotItem())
+        self.cbar.sigLevelsChangeFinished.connect(self._levels_dragged)
+        self.manual_levels: tuple[float, float] | None = None
         self.band = pg.LinearRegionItem(orientation="horizontal", movable=False,
                                         brush=pg.mkBrush(255, 255, 255, 18))
         for line in self.band.lines:
@@ -250,71 +264,245 @@ class SpectrogramView(pg.PlotWidget):
         self.sel_box.setZValue(10)
         self.sel_box.setVisible(False)
         self.addItem(self.sel_box, ignoreBounds=True)
-        self.overlay = _DetectionOverlay(self, boxes=True)
+        self.cursor = pg.InfiniteLine(angle=90, movable=False,
+                                      pen=pg.mkPen((255, 255, 255, 90), dash=[2, 4]))
+        self.addItem(self.cursor, ignoreBounds=True)
+        self.log_freq = False
+        self.f_min_log = 10.0
         self.f_max = 1.0
+        self._sel_hz: tuple[float, float] | None = None
+        self._band_hz: tuple[float, float] | None = None
+        self._img: tuple | None = None  # (data rows x frames, t0, t1, y0, y1)
+        self.overlay = _DetectionOverlay(self, boxes=True, fy=self.fy)
+
+    # -- frequency mapping (Hz <-> view y) -----------------------------------------
+    def fy(self, f: float) -> float:
+        if self.log_freq:
+            return float(np.log10(max(f, self.f_min_log)))
+        return float(f)
+
+    def inv_fy(self, y: float) -> float:
+        return float(10 ** y) if self.log_freq else float(y)
+
+    def set_log_freq(self, on: bool, f_min: float = 10.0) -> None:
+        if on == self.log_freq and f_min == self.f_min_log:
+            return
+        self.log_freq, self.f_min_log = on, max(f_min, 0.1)
+        self.getPlotItem().setLogMode(False, on)
+        self.f_max = -1.0  # force a y-range reset on the next image
+        self.overlay.clear()
+        if self._sel_hz is not None:
+            r = self.sel_box.rect()
+            self.set_selection(r.left(), r.right(), *self._sel_hz)
+        if self._band_hz is not None:
+            self.set_band(*self._band_hz)
 
     def set_colormap(self, name: str) -> None:
-        self.image.setLookupTable(lookup_table(name))
+        self.cbar.setColorMap(colormap(name))
 
-    def set_image(self, t0: float, t1: float, f_max: float, data: np.ndarray,
+    def _levels_dragged(self, bar) -> None:
+        lo, hi = bar.levels()
+        self.manual_levels = (lo, hi)
+        self.levels_dragged.emit(lo, hi)
+
+    def set_image(self, t0: float, t1: float, freqs: np.ndarray, data: np.ndarray,
                   levels: tuple[float, float]) -> None:
-        """``data`` is (bins, frames) in dB."""
-        if data.size == 0 or t1 <= t0:
+        """``data`` is (bins, frames) in dB for bin frequencies ``freqs``."""
+        if data.size == 0 or t1 <= t0 or len(freqs) < 2:
             return
-        self.image.setImage(data, autoLevels=False, levels=levels)
-        self.image.setRect(QRectF(t0, 0.0, t1 - t0, f_max))
-        if f_max != self.f_max:
-            self.f_max = f_max
-            self.setYRange(0, f_max, padding=0)
+        f_top = float(freqs[-1])
+        if self.log_freq:
+            lo_f = max(self.f_min_log, float(freqs[1]))
+            rows = min(len(freqs), 600)
+            grid = np.logspace(np.log10(lo_f), np.log10(f_top), rows)
+            pos = np.interp(grid, freqs, np.arange(len(freqs)))
+            i0 = np.floor(pos).astype(int)
+            i1 = np.minimum(i0 + 1, len(freqs) - 1)
+            w = (pos - i0)[:, None]
+            data = data[i0] * (1 - w) + data[i1] * w
+            y0, y1 = np.log10(lo_f), np.log10(f_top)
+        else:
+            half = (freqs[1] - freqs[0]) / 2
+            y0, y1 = max(0.0, float(freqs[0]) - half), f_top + half
+        self.image.setImage(data, autoLevels=False)
+        self.image.setRect(QRectF(t0, y0, t1 - t0, y1 - y0))
+        self.cbar.setLevels(self.manual_levels or levels)
+        self._img = (data, t0, t1, y0, y1)
+        if f_top != self.f_max:
+            self.f_max = f_top
+            self.setYRange(y0, y1, padding=0)
+
+    def value_at(self, x: float, y: float) -> float | None:
+        if self._img is None:
+            return None
+        data, t0, t1, y0, y1 = self._img
+        if not (t0 <= x <= t1 and y0 <= y <= y1):
+            return None
+        col = min(int((x - t0) / (t1 - t0) * data.shape[1]), data.shape[1] - 1)
+        row = min(int((y - y0) / (y1 - y0) * data.shape[0]), data.shape[0] - 1)
+        return float(data[row, col])
 
     def set_band(self, lo: float | None, hi: float | None) -> None:
         if lo is None:
+            self._band_hz = None
             self.band.setVisible(False)
             return
-        self.band.setRegion((lo, hi))
+        self._band_hz = (lo, hi)
+        self.band.setRegion((self.fy(lo), self.fy(hi)))
         self.band.setVisible(True)
 
     def set_selection(self, t0, t1, f0, f1) -> None:
-        self.sel_box.setRect(QRectF(min(t0, t1), min(f0, f1), abs(t1 - t0), abs(f1 - f0)))
+        """Times in s, frequencies in Hz."""
+        f0, f1 = sorted((f0, f1))
+        self._sel_hz = (f0, f1)
+        y0, y1 = self.fy(f0), self.fy(f1)
+        self.sel_box.setRect(QRectF(min(t0, t1), y0, abs(t1 - t0), y1 - y0))
         self.sel_box.setVisible(True)
 
     def clear_selection(self) -> None:
+        self._sel_hz = None
         self.sel_box.setVisible(False)
 
     def selected_band(self) -> tuple[float, float] | None:
-        if not self.sel_box.isVisible():
-            return None
-        r = self.sel_box.rect()
-        return max(0.0, r.top()), r.bottom()
+        return self._sel_hz if self.sel_box.isVisible() else None
 
     def update_detections(self, detections, selected: int | None = None) -> None:
         (x0, x1), (_y0, y1) = self.viewRange()
         self.overlay.update(detections, (x0, x1), y1, selected)
 
 
-class SpectrumPlot(_MultiCurvePlot):
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setLabel("bottom", "Frequency", units="Hz")
-        self.setLabel("left", "Level", units="dB")
-        self.floor_curve = self.plot([], [], name="noise floor",
-                                     pen=pg.mkPen("#bbbbbb", width=1, dash=[5, 4]))
-
-
-class LevelsPlot(pg.PlotWidget):
-    """Levels over time: broadband, noise floor, filter band, 63/125 Hz."""
-
-    SERIES = [("Broadband", "#4cc9f0"), ("Noise floor", "#bbbbbb"), ("Filter band", "#ffd166"),
-              ("63 Hz ⅓-oct", "#b5e48c"), ("125 Hz ⅓-oct", "#c77dff")]
+class SpectrumPlot(pg.PlotWidget):
+    """Power spectral density of the last integration interval, with the
+    5th/50th/95th percentiles over the statistics window and the noise floor."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.showGrid(x=True, y=True, alpha=0.25)
         self.addLegend(offset=(8, 8))
+        self.setLabel("bottom", "Frequency", units="Hz")
+        self.p95 = self.plot([], [], name="95th pct", pen=pg.mkPen((247, 37, 133, 170), width=1))
+        self.p5 = self.plot([], [], name="5th pct", pen=pg.mkPen((76, 201, 240, 170), width=1))
+        self.p50 = self.plot([], [], name="median", pen=pg.mkPen((230, 230, 230, 200), width=1,
+                                                                   dash=[4, 3]))
+        self.current = self.plot([], [], name="PSD (latest)", pen=pg.mkPen("#ffd166", width=1.5))
+        self.floor_curve = self.plot([], [], name="noise floor",
+                                     pen=pg.mkPen("#9a9a9a", width=1, dash=[5, 4]))
+
+    MAX_POINTS = 1200
+
+    def _reduce(self, freqs: np.ndarray, values: np.ndarray, keep_min: bool = False):
+        """Thin a dense spectrum to ~MAX_POINTS (log-spaced buckets on a log
+        axis), keeping each bucket's peak so tonal lines stay visible."""
+        f, v = freqs[1:], values[1:]  # no DC (log axes can't show 0 Hz)
+        n = len(f)
+        if n <= self.MAX_POINTS:
+            return f, v
+        if self.getPlotItem().ctrl.logXCheck.isChecked():
+            edges = np.unique(np.round(np.logspace(0, np.log10(n), self.MAX_POINTS)).astype(int)) - 1
+        else:
+            edges = np.linspace(0, n, self.MAX_POINTS + 1).astype(int)[:-1]
+        edges = np.unique(np.clip(edges, 0, n - 1))
+        red = np.minimum.reduceat if keep_min else np.maximum.reduceat
+        return f[edges], red(np.nan_to_num(v, nan=-300.0), edges)
+
+    def set_psd(self, freqs, current, pct: dict, floor_f=None, floor_db=None,
+                units: str = "dB") -> None:
+        self.setLabel("left", "PSD", units=units)
+        if current is not None:
+            self.current.setData(*self._reduce(freqs, current))
+        for key, item in ((5, self.p5), (50, self.p50), (95, self.p95)):
+            if key in pct:
+                item.setData(*self._reduce(freqs, pct[key], keep_min=key == 5))
+            else:
+                item.setData([], [])
+        if floor_f is not None:
+            self.floor_curve.setData(*self._reduce(floor_f, floor_db))
+
+    def clear_series(self) -> None:
+        for item in (self.current, self.p5, self.p50, self.p95, self.floor_curve):
+            item.setData([], [])
+
+    def value_at(self, x: float, _y: float) -> str | None:
+        data = self.current.getData()
+        if data[0] is None or not len(data[0]):
+            return None
+        f = 10 ** x if self.getPlotItem().ctrl.logXCheck.isChecked() else x
+        i = int(np.argmin(np.abs(data[0] - f)))
+        return f"{data[0][i]:.1f} Hz · {data[1][i]:.1f} dB"
+
+
+class TolPlot(pg.PlotWidget):
+    """Third-octave band levels: bars for the last interval, with the median
+    and the 5-95 % range over the statistics window."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.showGrid(x=False, y=True, alpha=0.25)
+        self.setLabel("bottom", "Third-octave band (IEC 61260-1)")
+        self.bars = pg.BarGraphItem(x=[], height=[], width=0.75, brush=pg.mkBrush("#4cc9f0"))
+        self.addItem(self.bars)
+        self.err = pg.ErrorBarItem(x=np.zeros(0), y=np.zeros(0), pen=pg.mkPen("#f72585"))
+        self.addItem(self.err)
+        self.median = pg.ScatterPlotItem(size=6, brush=pg.mkBrush("#ffffff"), pen=None)
+        self.addItem(self.median)
+        self.labels: list[str] = []
+        self.values = np.zeros(0)
+
+    def set_levels(self, bands, current: np.ndarray, pct: dict | None, chosen=(),
+                   resolved=None, units: str = "dB") -> None:
+        n = len(bands)
+        if not n or current is None or not len(current):
+            return
+        x = np.arange(n, dtype=float)
+        finite = current[np.isfinite(current)]
+        base = (np.min(finite) - 10) if len(finite) else 0.0
+        brushes = []
+        for i, b in enumerate(bands):
+            if resolved is not None and not resolved[i]:
+                brushes.append(pg.mkBrush(110, 110, 110))
+            elif b.label in chosen:
+                brushes.append(pg.mkBrush("#ffd166"))
+            else:
+                brushes.append(pg.mkBrush("#4cc9f0"))
+        self.bars.setOpts(x=x, height=np.nan_to_num(current - base), y0=base, width=0.75,
+                          brushes=brushes)
+        if pct and all(k in pct for k in (5, 50, 95)):
+            self.err.setData(x=x, y=pct[50], top=pct[95] - pct[50], bottom=pct[50] - pct[5],
+                             beam=0.3)
+            self.median.setData(x=x, y=pct[50])
+        self.labels = [b.label for b in bands]
+        self.values = current
+        step = max(1, n // 12)
+        self.getAxis("bottom").setTicks([[(i, bands[i].label) for i in range(0, n, step)],
+                                         [(i, "") for i in range(n)]])
+        self.setLabel("left", "Band level", units=units)
+        self.setXRange(-0.6, n - 0.4, padding=0)
+
+    def value_at(self, x: float, _y: float) -> str | None:
+        i = int(round(x))
+        if 0 <= i < len(self.labels):
+            return f"{self.labels[i]} band · {self.values[i]:.1f} dB"
+        return None
+
+
+class LevelsPlot(pg.PlotWidget):
+    """Levels per integration interval: SPL, Lpk, noise floor, filter band
+    and the chosen third-octave bands."""
+
+    FIXED = [("SPL (L_p,rms)", "#4cc9f0", None), ("L_pk", "#f72585", [2, 3]),
+             ("Noise floor", "#9a9a9a", [5, 4]), ("Filter band", "#ffd166", None)]
+    BAND_COLORS = ["#b5e48c", "#c77dff", "#f8961e", "#06d6a0", "#ef476f", "#90e0ef"]
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.showGrid(x=True, y=True, alpha=0.25)
+        self.legend = self.addLegend(offset=(8, 8))
         self.setLabel("bottom", "Time", units="s")
-        self.curves = [self.plot([], [], name=n, pen=pg.mkPen(c, width=1.5))
-                       for n, c in self.SERIES]
-        self.curves[1].setPen(pg.mkPen("#bbbbbb", width=1.5, dash=[5, 4]))
+        self.fixed = []
+        for name, color, dash in self.FIXED:
+            pen = pg.mkPen(color, width=1.5, dash=dash) if dash else pg.mkPen(color, width=1.5)
+            self.fixed.append(self.plot([], [], name=name, pen=pen))
+        self.band_curves: dict[str, pg.PlotDataItem] = {}
         self.alarm = pg.InfiniteLine(angle=0, movable=False,
                                      pen=pg.mkPen("#ff5050", width=1, dash=[2, 2]),
                                      label="alarm", labelOpts={"color": "#ff5050",
@@ -322,14 +510,29 @@ class LevelsPlot(pg.PlotWidget):
         self.alarm.setVisible(False)
         self.addItem(self.alarm, ignoreBounds=True)
 
-    def set_data(self, t: np.ndarray, v: np.ndarray, offset: float, units: str,
-                 show_band: bool) -> None:
+    def set_data(self, t, intervals, offset: float, units: str, show_band: bool,
+                 show_peak: bool, bands: dict[str, np.ndarray]) -> None:
+        """``intervals`` columns: SPL, Lpk, SEL, floor, band (raw dB)."""
         self.setLabel("left", "Level", units=units)
-        for i, curve in enumerate(self.curves):
-            if i < v.shape[1] and (i != 2 or show_band):
-                curve.setData(t, v[:, i] + offset, connect="finite")
+        cols = {0: 0, 1: 1, 2: 3, 3: 4}
+        for i, curve in enumerate(self.fixed):
+            visible = not ((i == 1 and not show_peak) or (i == 3 and not show_band))
+            if visible and len(t):
+                curve.setData(t, intervals[:, cols[i]] + offset, connect="finite")
             else:
                 curve.setData([], [])
+        for name in list(self.band_curves):
+            if name not in bands:
+                self.removeItem(self.band_curves.pop(name))
+                self.legend.removeItem(name)
+        for i, (name, values) in enumerate(bands.items()):
+            curve = self.band_curves.get(name)
+            if curve is None:
+                curve = self.plot([], [], name=f"⅓-oct {name}",
+                                  pen=pg.mkPen(self.BAND_COLORS[i % len(self.BAND_COLORS)],
+                                               width=1.2))
+                self.band_curves[name] = curve
+            curve.setData(t, values + offset, connect="finite")
 
     def set_alarm(self, level: float | None) -> None:
         self.alarm.setVisible(level is not None)
@@ -337,16 +540,95 @@ class LevelsPlot(pg.PlotWidget):
             self.alarm.setValue(level)
 
 
+class RecordingOverviewView(pg.GraphicsLayoutWidget):
+    """Whole-recording navigator: long-term spectrogram on top, SPL below.
+    Click or drag to jump; shows the playback position and the visible window."""
+
+    seek_requested = Signal(float)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(110)
+        self.setMaximumHeight(170)
+        self.top = self.addPlot(row=0, col=0)
+        self.bottom = self.addPlot(row=1, col=0)
+        self.ci.layout.setRowStretchFactor(0, 3)
+        self.ci.layout.setRowStretchFactor(1, 1)
+        for plot in (self.top, self.bottom):
+            plot.setMouseEnabled(x=False, y=False)
+            plot.setMenuEnabled(False)
+            plot.hideButtons()
+        self.top.hideAxis("bottom")
+        self.top.setLogMode(False, True)
+        self.top.setLabel("left", "Hz")
+        self.bottom.setLabel("left", "SPL")
+        self.bottom.setXLink(self.top)
+        self.image = pg.ImageItem(axisOrder="row-major")
+        self.image.setLookupTable(lookup_table("inferno"))
+        self.top.addItem(self.image)
+        self.spl = self.bottom.plot([], [], pen=pg.mkPen("#4cc9f0", width=1))
+        self.window = pg.LinearRegionItem(movable=False, brush=pg.mkBrush(76, 201, 240, 50))
+        self.top.addItem(self.window, ignoreBounds=True)
+        self.pos_lines = [pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ffea00"))
+                          for _ in range(2)]
+        self.top.addItem(self.pos_lines[0], ignoreBounds=True)
+        self.bottom.addItem(self.pos_lines[1], ignoreBounds=True)
+        self.title = pg.LabelItem(justify="left")
+        self.addItem(self.title, row=2, col=0)
+        self.duration = 0.0
+        self.scene().sigMouseClicked.connect(self._clicked)
+
+    def set_overview(self, ov, offset: float = 0.0, label: str = "") -> None:
+        valid = ov.ltsa[:, :max(ov.done, 1)]
+        finite = valid[np.isfinite(valid)]
+        if len(finite):
+            hi = float(np.percentile(finite, 99.5))
+            self.image.setImage(np.nan_to_num(ov.ltsa, nan=float(finite.min())) + offset,
+                                autoLevels=False, levels=(hi - 60 + offset, hi + offset))
+        lf0, lf1 = np.log10(ov.freqs[0]), np.log10(ov.freqs[-1])
+        self.duration = float(ov.source.duration)
+        self.image.setRect(QRectF(0, lf0, self.duration, lf1 - lf0))
+        self.top.setXRange(0, self.duration, padding=0)
+        self.top.setYRange(lf0, lf1, padding=0)
+        self.spl.setData(ov.times, ov.spl + offset, connect="finite")
+        progress = "" if ov.complete else f"   (building overview {ov.done}/{ov.columns}…)"
+        self.title.setText(f"<span style='color:#9aa'>{label}{progress}</span>")
+
+    def set_position(self, t: float, window: tuple[float, float] | None) -> None:
+        for line in self.pos_lines:
+            line.setValue(t)
+        if window is not None:
+            self.window.setRegion(window)
+
+    def _clicked(self, event) -> None:
+        for plot in (self.top, self.bottom):
+            if plot.sceneBoundingRect().contains(event.scenePos()):
+                t = plot.vb.mapSceneToView(event.scenePos()).x()
+                if 0 <= t <= self.duration:
+                    self.seek_requested.emit(float(t))
+                return
+
+
 class PreviewView(pg.GraphicsLayoutWidget):
     """The captured region with the detected lines and calibration lines."""
 
     pixel_clicked = Signal(int, int)  # column, row
     line_moved = Signal(str, float)  # "ya" | "yb" | "xa" | "xb", pixel position
+    rect_picked = Signal(float, float, float, float)  # x0, y0, x1, y1 in image pixels
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.vb = self.addViewBox(lockAspect=True, invertY=True)
+        self.vb = SelectViewBox(lockAspect=True, invertY=True)
+        self.addItem(self.vb)
         self.vb.setMenuEnabled(False)
+        self.pick_rect = QGraphicsRectItem()
+        pen = QPen(QColor(80, 200, 255), 1, Qt.DashLine)
+        pen.setCosmetic(True)
+        self.pick_rect.setPen(pen)
+        self.pick_rect.setZValue(4)
+        self.pick_rect.setVisible(False)
+        self.vb.addItem(self.pick_rect, ignoreBounds=True)
+        self.vb.sigSelect.connect(self._dragging)
         self.image = pg.ImageItem(axisOrder="row-major")
         self.mask = pg.ImageItem(axisOrder="row-major")
         self.mask.setZValue(1)
@@ -400,6 +682,18 @@ class PreviewView(pg.GraphicsLayoutWidget):
         if shape != self._shape:
             self._shape = shape
             self.vb.setRange(xRange=(0, shape[1]), yRange=(0, shape[0]), padding=0.02)
+
+    def set_rect_pick(self, on: bool) -> None:
+        """Drag a rectangle (e.g. over a colour bar) instead of panning."""
+        self.vb.select_mode = on
+        if not on:
+            self.pick_rect.setVisible(False)
+
+    def _dragging(self, x0, x1, y0, y1, finished) -> None:
+        self.pick_rect.setRect(QRectF(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0)))
+        self.pick_rect.setVisible(True)
+        if finished:
+            self.rect_picked.emit(x0, y0, x1, y1)
 
     def set_line(self, key: str, px: float) -> None:
         line = self.lines[key]

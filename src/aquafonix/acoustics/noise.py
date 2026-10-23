@@ -13,25 +13,6 @@ from dataclasses import dataclass, field
 import numpy as np
 
 
-def third_octave_bands(f_max: float, f_min: float = 10.0):
-    """Base-10 third-octave bands ``[(centre, low, high)]`` below ``f_max``."""
-    bands = []
-    for k in range(-20, 14):
-        fc = 1000.0 * 10 ** (k / 10)
-        lo, hi = fc * 10 ** (-1 / 20), fc * 10 ** (1 / 20)
-        if fc >= f_min and hi <= f_max:
-            bands.append((fc, lo, hi))
-    return bands
-
-
-def nominal(fc: float) -> str:
-    """Nominal label of a third-octave centre, e.g. 63 Hz, 1.25 kHz."""
-    preferred = [10, 12.5, 16, 20, 25, 31.5, 40, 50, 63, 80]
-    decade = 10 ** np.floor(np.log10(fc) - 1)
-    best = min((p * decade for p in preferred + [100]), key=lambda v: abs(np.log(v / fc)))
-    return f"{best / 1000:g} kHz" if best >= 1000 else f"{best:g} Hz"
-
-
 def band_power(power: np.ndarray, freqs: np.ndarray, lo: float, hi: float) -> np.ndarray:
     """Sum of per-bin power (last axis) for bins with lo <= f < hi."""
     sel = (freqs >= lo) & (freqs < hi)
@@ -101,7 +82,8 @@ def tonal_lines(ltsa_db: np.ndarray, freqs: np.ndarray, persistence: np.ndarray 
 
 @dataclass
 class NoiseReport:
-    level_db: float = float("nan")  # broadband, current
+    level_db: float = float("nan")  # broadband SPL of the last interval
+    peak_db: float = float("nan")  # Lpk of the last interval
     floor_db: float = float("nan")  # broadband noise floor
     band_db: float = float("nan")  # filter band, if any
     stats: dict[str, float] = field(default_factory=dict)  # L5/L50/L95/Leq of broadband

@@ -3,19 +3,78 @@ signature matching, plus the live noise report."""
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QPushButton, QVBoxLayout, QWidget)
+from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
+                               QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QMessageBox, QPushButton,
+                               QVBoxLayout, QWidget)
 
 from aquafonix.acoustics.analyzer import AnalysisSettings, HydrophoneCalibration
 from aquafonix.acoustics.filters import FILTER_TYPES, PRESETS, BandSpec
+from aquafonix.acoustics.metrics import third_octave_bands
 from aquafonix.acoustics.noise import NoiseReport
 from aquafonix.acoustics.signatures import DEFAULT_THRESHOLD
 from aquafonix.ui.widgets import combo, named, spin
 
 NFFT_CHOICES = {"0": "Automatic (~30 ms)", "256": "256", "512": "512", "1024": "1024",
                 "2048": "2048", "4096": "4096", "8192": "8192", "16384": "16384"}
+PSD_NFFT_CHOICES = {"0": "Automatic (~1 Hz)", "1024": "1024", "2048": "2048", "4096": "4096",
+                    "8192": "8192", "16384": "16384", "32768": "32768", "65536": "65536"}
+INTEGRATION_CHOICES = {"0.125": "0.125 s", "0.25": "0.25 s", "0.5": "0.5 s", "1": "1 s",
+                       "2": "2 s", "5": "5 s", "10": "10 s", "30": "30 s", "60": "1 min",
+                       "600": "10 min"}
+
+
+def parse_bands(text: str) -> tuple[str, ...]:
+    """'63, 125 Hz, 2 kHz' -> ('63 Hz', '125 Hz', '2 kHz') matched to nominal labels."""
+    labels = {b.label.lower().replace(" ", ""): b.label for b in third_octave_bands(1e6)}
+    out = []
+    for part in text.replace(";", ",").split(","):
+        key = part.strip().lower().replace(" ", "")
+        if not key:
+            continue
+        if key[-1].isdigit():
+            key += "hz"
+        if key.endswith("khz"):
+            pass
+        elif key.endswith("hz"):
+            try:
+                v = float(key[:-2])
+                key = f"{v / 1000:g}khz" if v >= 1000 else f"{v:g}hz"
+            except ValueError:
+                pass
+        if key in labels and labels[key] not in out:
+            out.append(labels[key])
+    return tuple(out)
+
+
+class BandPicker(QDialog):
+    """Tick the third-octave bands to chart over time."""
+
+    def __init__(self, parent, selected: tuple[str, ...], f_max: float = 192_000) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Third-octave bands over time")
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Bands (IEC 61260-1 base-10) to plot over time:"))
+        self.list = QListWidget()
+        for b in third_octave_bands(f_max):
+            item = QListWidgetItem(f"{b.label}   ({b.low:.1f}–{b.high:.1f} Hz)")
+            item.setData(Qt.UserRole, b.label)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if b.label in selected else Qt.Unchecked)
+            self.list.addItem(item)
+        lay.addWidget(self.list)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def selected(self) -> tuple[str, ...]:
+        return tuple(self.list.item(i).data(Qt.UserRole) for i in range(self.list.count())
+                     if self.list.item(i).checkState() == Qt.Checked)
 
 
 def _group(title: str, parent_layout: QVBoxLayout) -> QFormLayout:
@@ -45,6 +104,28 @@ class AcousticsPanel(QWidget):
         self.nfft.setToolTip("Spectrogram FFT size: larger = finer frequency, coarser time")
         f.addRow("FFT size", self.nfft)
 
+        f = _group("Levels (ISO 18405)", lay)
+        self.integration = named(combo(INTEGRATION_CHOICES, "1"), "ac.integration")
+        self.integration.setToolTip("Averaging time for SPL, Lpk, SEL, PSD and band levels")
+        f.addRow("Integration time", self.integration)
+        self.psd_nfft = named(combo(PSD_NFFT_CHOICES, "0"), "ac.psdnfft")
+        self.psd_nfft.setToolTip("FFT size for PSD and third-octave levels (frequency "
+                                 "resolution = sample rate / size)")
+        f.addRow("PSD FFT size", self.psd_nfft)
+        brow = QHBoxLayout()
+        self.tol_text = named(QLineEdit("63 Hz, 125 Hz, 2 kHz"), "ac.tolbands")
+        self.tol_text.setToolTip("Third-octave bands charted over time (comma-separated)")
+        self.tol_text.editingFinished.connect(self._changed)
+        pick = QPushButton("…")
+        pick.setFixedWidth(30)
+        pick.clicked.connect(self._pick_bands)
+        brow.addWidget(self.tol_text, 1)
+        brow.addWidget(pick)
+        f.addRow("Bands over time", brow)
+        self.stats_window = named(spin(5, 86_400, 60, suffix=" s"), "ac.statswindow")
+        self.stats_window.setToolTip("Window for L5/L50/L95 and PSD/band percentiles")
+        f.addRow("Statistics over", self.stats_window)
+
         f = _group("Hydrophone calibration", lay)
         self.cal_on = named(QCheckBox("Show levels in dB re 1 µPa"), "ac.cal")
         f.addRow(self.cal_on)
@@ -55,6 +136,27 @@ class AcousticsPanel(QWidget):
         f.addRow("Sensitivity", self.sens)
         f.addRow("Pre-amp gain", self.gain)
         f.addRow("Full scale", self.vfs)
+        prow = QHBoxLayout()
+        self.profiles = QComboBox()
+        self.profiles.setToolTip("Saved hydrophone / recorder calibrations")
+        self.profiles.activated.connect(self._load_profile)
+        save_p = QPushButton("Save…")
+        save_p.clicked.connect(self._save_profile)
+        del_p = QPushButton("Delete")
+        del_p.clicked.connect(self._delete_profile)
+        prow.addWidget(self.profiles, 1)
+        prow.addWidget(save_p)
+        prow.addWidget(del_p)
+        f.addRow("Profile", prow)
+        self.cal_auto = named(QCheckBox("Use calibration found in a recording's metadata"),
+                              "ac.calauto")
+        self.cal_auto.setChecked(True)
+        f.addRow(self.cal_auto)
+        self.cal_source = QLabel("")
+        self.cal_source.setWordWrap(True)
+        self.cal_source.setStyleSheet("color: gray;")
+        f.addRow(self.cal_source)
+        self._store: QSettings | None = None
 
         f = _group("Band isolation", lay)
         self.band_on = named(QCheckBox("Isolate a frequency band"), "ac.band")
@@ -94,8 +196,6 @@ class AcousticsPanel(QWidget):
         self.fall = named(spin(0.1, 600, 2, decimals=1, suffix=" s"), "ac.floorfall")
         f.addRow("Rise time", self.rise)
         f.addRow("Fall time", self.fall)
-        self.stats_window = named(spin(5, 3600, 60, suffix=" s"), "ac.statswindow")
-        f.addRow("Statistics over", self.stats_window)
         self.alarm_on = named(QCheckBox("Alarm when the floor exceeds"), "ac.alarm")
         self.alarm_level = named(spin(-300, 300, 100, decimals=1, suffix=" dB"), "ac.alarmlevel")
         row = QHBoxLayout()
@@ -109,7 +209,7 @@ class AcousticsPanel(QWidget):
         f.addRow(self.detect_on)
         self.threshold = named(spin(1, 60, 10, decimals=1, suffix=" dB"), "ac.threshold")
         f.addRow("Spike threshold", self.threshold)
-        self.min_dur = named(spin(0.001, 60, 0.03, decimals=3, suffix=" s"), "ac.mindur")
+        self.min_dur = named(spin(0.0, 60, 0.005, decimals=3, suffix=" s"), "ac.mindur")
         self.max_dur = named(spin(0.01, 600, 10, decimals=2, suffix=" s"), "ac.maxdur")
         f.addRow("Min duration", self.min_dur)
         f.addRow("Max duration", self.max_dur)
@@ -134,16 +234,83 @@ class AcousticsPanel(QWidget):
         lay.addWidget(box)
         lay.addStretch(1)
 
-        for w in (self.channel, self.nfft, self.band_kind):
+        for w in (self.channel, self.nfft, self.band_kind, self.integration, self.psd_nfft):
             w.currentIndexChanged.connect(self._changed)
         for w in (self.cal_on, self.band_on, self.band_show, self.band_listen, self.band_detect,
                   self.alarm_on, self.detect_on, self.match_on):
             w.toggled.connect(self._changed)
+        for w in (self.sens, self.gain, self.vfs):
+            w.valueChanged.connect(lambda *_: self.cal_source.setText("Entered by hand"))
         for w in (self.sens, self.gain, self.vfs, self.band_lo, self.band_hi, self.rise,
                   self.fall, self.stats_window, self.alarm_level, self.threshold, self.min_dur,
                   self.max_dur, self.match_thr):
             w.valueChanged.connect(self._changed)
         self._update_visibility()
+
+    # -- calibration profiles -------------------------------------------------------
+    def set_profile_store(self, settings: QSettings) -> None:
+        self._store = settings
+        self._refresh_profiles()
+
+    def _profiles(self) -> dict:
+        if self._store is None:
+            return {}
+        try:
+            return json.loads(self._store.value("calibration/profiles", "{}") or "{}")
+        except ValueError:
+            return {}
+
+    def _refresh_profiles(self) -> None:
+        self.profiles.clear()
+        self.profiles.addItem("— choose a saved profile —")
+        for name in sorted(self._profiles(), key=str.lower):
+            self.profiles.addItem(name)
+
+    def _save_profile(self) -> None:
+        if self._store is None:
+            return
+        name, ok = QInputDialog.getText(self, "Save calibration profile",
+                                        "Name (e.g. hydrophone model + serial, gain setting)")
+        if not ok or not name.strip():
+            return
+        profiles = self._profiles()
+        profiles[name.strip()] = {"sensitivity_db": self.sens.value(),
+                                  "gain_db": self.gain.value(), "full_scale_v": self.vfs.value()}
+        self._store.setValue("calibration/profiles", json.dumps(profiles))
+        self._refresh_profiles()
+        self.profiles.setCurrentText(name.strip())
+
+    def _delete_profile(self) -> None:
+        name = self.profiles.currentText()
+        profiles = self._profiles()
+        if name in profiles and QMessageBox.question(
+                self, "Delete profile", f"Delete '{name}'?") == QMessageBox.Yes:
+            del profiles[name]
+            self._store.setValue("calibration/profiles", json.dumps(profiles))
+            self._refresh_profiles()
+
+    def _load_profile(self, index: int) -> None:
+        p = self._profiles().get(self.profiles.itemText(index))
+        if p:
+            self.apply_calibration(p["sensitivity_db"], p["gain_db"], p["full_scale_v"],
+                                   f"profile '{self.profiles.itemText(index)}'")
+
+    def apply_calibration(self, sensitivity_db: float, gain_db: float, full_scale_v: float,
+                          source: str = "") -> None:
+        for w in (self.sens, self.gain, self.vfs, self.cal_on):
+            w.blockSignals(True)
+        self.sens.setValue(sensitivity_db)
+        self.gain.setValue(gain_db)
+        self.vfs.setValue(full_scale_v)
+        self.cal_on.setChecked(True)
+        for w in (self.sens, self.gain, self.vfs, self.cal_on):
+            w.blockSignals(False)
+        self.cal_source.setText(f"From {source}" if source else "")
+        self._changed()
+
+    def calibration_values(self) -> dict:
+        return {"sensitivity_db": self.sens.value(), "gain_db": self.gain.value(),
+                "full_scale_v": self.vfs.value(), "enabled": self.cal_on.isChecked()}
 
     # -- values -----------------------------------------------------------------
     def calibration(self) -> HydrophoneCalibration:
@@ -175,7 +342,18 @@ class AcousticsPanel(QWidget):
             min_event_s=self.min_dur.value(), max_event_s=self.max_dur.value(),
             detect_in_band=self.band_detect.isChecked(), match=self.match_on.isChecked(),
             match_threshold=self.match_thr.value(), floor_alarm=self.alarm_on.isChecked(),
-            floor_alarm_db=self.alarm_level.value(), stats_window_s=self.stats_window.value())
+            floor_alarm_db=self.alarm_level.value(), stats_window_s=self.stats_window.value(),
+            integration_s=float(self.integration.currentData()),
+            psd_nfft=int(self.psd_nfft.currentData()), tol_bands=self.tol_bands())
+
+    def tol_bands(self) -> tuple[str, ...]:
+        return parse_bands(self.tol_text.text())
+
+    def _pick_bands(self) -> None:
+        dlg = BandPicker(self, self.tol_bands())
+        if dlg.exec():
+            self.tol_text.setText(", ".join(dlg.selected()))
+            self._changed()
 
     # -- report -----------------------------------------------------------------
     def show_report(self, rep: NoiseReport, alarm: bool) -> None:
@@ -183,7 +361,8 @@ class AcousticsPanel(QWidget):
             return f"{x:.1f}{unit}" if x is not None and np.isfinite(x) else "–"
 
         u = rep.units
-        lines = [f"<b>Level</b> {v(rep.level_db)} &nbsp; <b>Floor</b> {v(rep.floor_db)}"
+        lines = [f"<b>SPL</b> {v(rep.level_db)} &nbsp; <b>L<sub>pk</sub></b> {v(rep.peak_db)}"
+                 f" &nbsp; <b>Floor</b> {v(rep.floor_db)}"
                  + (" <span style='color:#ff5050'><b>⚠ ALARM</b></span>" if alarm else "")
                  + f" <span style='color:gray'>({u})</span>"]
         if np.isfinite(rep.band_db):
@@ -194,7 +373,9 @@ class AcousticsPanel(QWidget):
                          f"L95 {v(st.get('L95'))} · Leq {v(st.get('Leq'))}")
         tol = rep.third_octaves
         if tol:
-            lines.append(f"⅓-oct 63 Hz {v(tol.get('63 Hz'))} · 125 Hz {v(tol.get('125 Hz'))}")
+            shown = [b for b in self.tol_bands() if b in tol] or [b for b in ("63 Hz", "125 Hz")
+                                                                    if b in tol]
+            lines.append("⅓-oct " + " · ".join(f"{b} {v(tol[b])}" for b in shown))
         lines.append(f"Crest {v(rep.crest_db)} · kurtosis {v(rep.kurtosis, '')} · "
                      f"flatness {v(rep.flatness, '')}")
         if rep.tonals:

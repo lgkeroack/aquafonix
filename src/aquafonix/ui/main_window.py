@@ -31,10 +31,14 @@ from aquafonix.screen.overlay import RegionOutline, RegionSelector
 from aquafonix.sources import Source
 from aquafonix.sources.audiofile import AudioFileSource
 from aquafonix.ui.acoustics_panel import AcousticsPanel
+from aquafonix.ui.detail import SelectionDetail
 from aquafonix.ui.dialogs import IdentifyDialog, SignatureManager, ask_label
 from aquafonix.ui.panels import PANELS, AudioFilePanel, ScreenPanel, SourcePanel
-from aquafonix.ui.plots import (COLORMAPS, LevelsPlot, OverviewPlot, PreviewView, SpectrogramView,
-                                SpectrumPlot, TimePlot, channel_color)
+from aquafonix.acoustics.metrics import band_resolution_ok, percentiles_db
+from aquafonix.acoustics.longterm import RecordingOverview
+from aquafonix.ui.plots import (COLORMAPS, LevelsPlot, OverviewPlot, PreviewView,
+                                RecordingOverviewView, SpectrogramView, SpectrumPlot, TimePlot,
+                                TolPlot, channel_color)
 from aquafonix.ui.review import DetectionsPanel, EventsPanel
 from aquafonix.ui.widgets import combo, named, restore_state, save_state, set_widget_value, spin
 
@@ -68,6 +72,8 @@ class MainWindow(QMainWindow):
         self.source: Source | None = None
         self.buffer: RingBuffer | None = None
         self.analyzer: Analyzer | None = None
+        self.rec_overview: RecordingOverview | None = None
+        self._ov_final = False
         self.recorder: CsvRecorder | WavRecorder | None = None
         self.explore = False  # display frozen; the user navigates the history
         self._wall0: float | None = None
@@ -76,7 +82,6 @@ class MainWindow(QMainWindow):
         self._last_version = -1
         self._last_frame = None
         self._view: tuple[np.ndarray, np.ndarray, list[str]] | None = None
-        self._spec_avg: dict[str, np.ndarray] = {}
         self._rate_mark = (time.perf_counter(), 0)
         self._slow_t = 0.0
         self._status_t = 0.0
@@ -87,6 +92,11 @@ class MainWindow(QMainWindow):
         self._seeking = False
         self._last_det_id = 0
         self._det_table_t = 0.0
+        self._psd_key = None
+        self._tol_key = None
+        self._levels_key = None
+        self._spectro_t = 0.0
+        self._bands_t = 0.0
         self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.resize(1440, 900)
         self.selector = RegionSelector(self)
@@ -94,6 +104,7 @@ class MainWindow(QMainWindow):
         self.outline = RegionOutline()
         self._build()
         self._restore()
+        self.acoustics.set_profile_store(self.settings)
         self.events_panel.set_store(self.store)
         self.events_panel.set_tag_suggestions(self.library.labels())
         self.timer = QTimer(self)
@@ -110,6 +121,9 @@ class MainWindow(QMainWindow):
         self._build_review()
         self.status_label = QLabel("")
         self.statusBar().addWidget(self.status_label, 1)
+        self.cursor_label = QLabel("")
+        self.cursor_label.setStyleSheet("color:#c8d0d8;")
+        self.statusBar().addPermanentWidget(self.cursor_label)
         self.alarm_label = QLabel("")
         self.statusBar().addPermanentWidget(self.alarm_label)
         self._wire()
@@ -144,6 +158,9 @@ class MainWindow(QMainWindow):
         self.act_select = a("⇔ Select", self._set_select_mode, "S", checkable=True,
                             tip="Drag to select a sound (Shift-drag works any time)")
         self.act_zoom_sel = a("Zoom to selection", self.zoom_to_selection, "Z")
+        self.act_analyse = a("📊 Analyse", self.analyse_selection, "A",
+                             tip="Open a detail window for the selection: SPL, Lpk, SEL, "
+                                 "PSD, third-octave levels, bandwidths")
         self.act_identify = a("🏷 Identify…", self.identify_selection, "I",
                               tip="Name the selected sound so later occurrences are flagged")
         self.act_play_sel = a("▶ Play selection", self.play_selection, "P")
@@ -166,7 +183,8 @@ class MainWindow(QMainWindow):
                     self.act_zoom_out_y, self.act_fit, self.act_box):
             tb.addAction(act)
         tb.addSeparator()
-        for act in (self.act_select, self.act_identify, self.act_play_sel, self.act_save_sel):
+        for act in (self.act_select, self.act_analyse, self.act_identify, self.act_play_sel,
+                    self.act_save_sel):
             tb.addAction(act)
         tb.addSeparator()
         tb.addAction(self.act_listen)
@@ -192,10 +210,11 @@ class MainWindow(QMainWindow):
         m.addAction(self._action("Exit", self.close))
         self.view_menu = mb.addMenu("&View")
         m = mb.addMenu("&Tools")
-        for act in (self.act_capture, self.act_identify, self.act_play_sel, self.act_save_sel,
-                    self.act_listen):
+        for act in (self.act_capture, self.act_analyse, self.act_identify, self.act_play_sel,
+                    self.act_save_sel, self.act_listen):
             m.addAction(act)
         m.addAction(self._action("Signatures…", self.manage_signatures))
+        m.addAction(self._action("Batch analysis of recordings…", self.batch_analysis))
         m = mb.addMenu("&Help")
         m.addAction(self._action("Keyboard shortcuts", lambda: QMessageBox.information(
             self, "Shortcuts", SHORTCUTS)))
@@ -295,19 +314,33 @@ class MainWindow(QMainWindow):
         self.f_max = named(spin(0, 1e6, 0, decimals=0, suffix=" Hz"), "display.fmax")
         self.f_max.setSpecialValueText("Nyquist")
         f.addRow("Max frequency", self.f_max)
+        self.auto_detail = named(QCheckBox("Open the analysis window when I select on it"),
+                                 "display.autodetail")
+        f.addRow(self.auto_detail)
+        self.spec_log = named(QCheckBox("Logarithmic frequency axis"), "display.speclog")
+        f.addRow(self.spec_log)
+        self.f_min_log = named(spin(0.1, 1e5, 10, decimals=1, suffix=" Hz"), "display.fminlog")
+        f.addRow("Lowest frequency (log)", self.f_min_log)
         dl.addWidget(box)
 
-        box = QGroupBox("Spectrum && levels")
+        box = QGroupBox("PSD, bands && levels")
         f = QFormLayout(box)
-        self.spectrum_on = named(QCheckBox("Show spectrum"), "display.spectrum")
+        self.spectrum_on = named(QCheckBox("Show power spectral density (PSD)"),
+                                 "display.spectrum")
         f.addRow(self.spectrum_on)
         self.fft_log = named(QCheckBox("Log frequency axis"), "display.fftlog")
+        self.fft_log.setChecked(True)
         f.addRow(self.fft_log)
-        self.fft_avg = named(spin(0, 0.99, 0.7, decimals=2, step=0.05), "display.fftavg")
-        f.addRow("Averaging", self.fft_avg)
+        self.psd_pct = named(QCheckBox("Show 5 / 50 / 95 % percentiles"), "display.psdpct")
+        self.psd_pct.setChecked(True)
+        f.addRow(self.psd_pct)
+        self.tol_on = named(QCheckBox("Show third-octave band levels"), "display.tol")
+        f.addRow(self.tol_on)
         self.levels_on = named(QCheckBox("Show levels over time"), "display.levels")
         self.levels_on.setChecked(True)
         f.addRow(self.levels_on)
+        self.peak_on = named(QCheckBox("Include peak level (Lpk)"), "display.lpk")
+        f.addRow(self.peak_on)
         self._spec_form = f
         dl.addWidget(box)
         dl.addStretch(1)
@@ -386,6 +419,7 @@ class MainWindow(QMainWindow):
         self.spectro = SpectrogramView()
         self.spectro.setXLink(self.time_plot)
         self.spec_plot = SpectrumPlot()
+        self.tol_plot = TolPlot()
         self.levels_plot = LevelsPlot()
 
         # transport bar for replaying files
@@ -413,6 +447,10 @@ class MainWindow(QMainWindow):
         wl.setContentsMargins(0, 0, 0, 0)
         wl.setSpacing(0)
         wl.addWidget(self.transport)
+        self.rec_view = RecordingOverviewView()
+        self.rec_view.setVisible(False)
+        self.rec_view.seek_requested.connect(self._seek_to)
+        wl.addWidget(self.rec_view)
         wl.addWidget(self.overview)
         wl.addWidget(self.time_plot, 1)
         self.readout = QLabel("")
@@ -421,7 +459,11 @@ class MainWindow(QMainWindow):
         wl.addWidget(self.readout)
 
         self.plot_split = QSplitter(Qt.Vertical)
-        for w in (self.preview, wave, self.spectro, self.spec_plot, self.levels_plot):
+        bottom = QSplitter(Qt.Horizontal)
+        bottom.addWidget(self.spec_plot)
+        bottom.addWidget(self.tol_plot)
+        self.bottom_split = bottom
+        for w in (self.preview, wave, self.spectro, bottom, self.levels_plot):
             self.plot_split.addWidget(w)
         for i, stretch in enumerate((2, 3, 3, 2, 2)):
             self.plot_split.setStretchFactor(i, stretch)
@@ -448,11 +490,17 @@ class MainWindow(QMainWindow):
         for w in (self.xaxis, self.mode, self.cmap):
             w.currentIndexChanged.connect(self._display_changed)
         for w in (self.y_auto, self.spectrum_on, self.fft_log, self.spectro_on, self.levels_on,
-                  self.overview_on, self.spec_snr, self.db_auto):
+                  self.overview_on, self.spec_snr, self.db_auto, self.spec_log, self.tol_on,
+                  self.psd_pct, self.peak_on):
             w.toggled.connect(self._display_changed)
         for w in (self.y_min, self.y_max, self.window_s, self.window_n, self.db_range,
-                  self.f_max):
+                  self.f_max, self.f_min_log):
             w.valueChanged.connect(self._display_changed)
+        self.db_auto.toggled.connect(self._db_auto_toggled)
+        self.spectro.levels_dragged.connect(lambda *_: self.db_auto.setChecked(False))
+        for plot in (self.time_plot, self.spectro, self.spec_plot, self.tol_plot,
+                     self.levels_plot):
+            plot.scene().sigMouseMoved.connect(lambda pos, p=plot: self._hover(p, pos))
         self.pre_roll.valueChanged.connect(self._update_capture_text)
         self.trig_level.valueChanged.connect(self._trigger_level_edited)
         self.time_plot.trigger_line.sigPositionChanged.connect(
@@ -475,6 +523,8 @@ class MainWindow(QMainWindow):
         sp.changed.connect(self._screen_settings_changed)
         self.preview.line_moved.connect(sp.set_cal_px)
         self.preview.pixel_clicked.connect(self._preview_clicked)
+        sp.pick_bar.toggled.connect(self.preview.set_rect_pick)
+        self.preview.rect_picked.connect(self._bar_picked)
 
         d = self.det_panel
         d.confirm.connect(self.confirm_detection)
@@ -543,11 +593,22 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_NAME, f"Could not start {panel.title}:\n\n{exc}")
             return False
         self._stop_analyzer()
+        if isinstance(src, AudioFileSource):
+            self._apply_file_calibration(src.path)
         self.source, self.buffer = src, buffer
         live = not isinstance(src, AudioFileSource)
         self._wall0 = time.time() if live else None
+        if self.rec_overview is not None:
+            self.rec_overview.stop()
+            self.rec_overview = None
+        if isinstance(src, AudioFileSource):
+            self.rec_overview = RecordingOverview(src, int(self.acoustics.channel.currentData()))
+            self.rec_overview.start()
+            self._ov_final = False
+        self.rec_view.setVisible(isinstance(src, AudioFileSource))
         self.analyzer = Analyzer(buffer, self.matcher, self.acoustics.settings(),
                                  src.sample_rate, history, self._wall_clock)
+        src.add_frame_listener(self.analyzer.feed_frames)
         self.analyzer.start()
         if isinstance(src, AudioFileSource):
             src.throttle = lambda: self.analyzer.processed_index if self.analyzer else 0
@@ -589,6 +650,8 @@ class MainWindow(QMainWindow):
         self._reset_view()
 
     def _wall_clock(self, t: float) -> float | None:
+        if isinstance(self.source, AudioFileSource):
+            return self.source.wall_time(t)
         return self._wall0 + t if self._wall0 is not None else None
 
     def _source_desc(self) -> str:
@@ -605,7 +668,6 @@ class MainWindow(QMainWindow):
     def _reset_view(self) -> None:
         self.time_plot.clear_series()
         self.spec_plot.clear_series()
-        self._spec_avg.clear()
         self._last_version = -1
         self._last_frame = None
         self._view = None
@@ -632,7 +694,9 @@ class MainWindow(QMainWindow):
             if dbuf is not None and dbuf.version != self._last_version:
                 self._last_version = dbuf.version
                 self._refresh_live(dbuf)
-                if self.spectro.isVisible():
+                now = time.perf_counter()
+                if self.spectro.isVisible() and now - self._spectro_t > 0.08:
+                    self._spectro_t = now
                     self._render_spectrogram(*self.time_plot.viewRange()[0])
         elif self._explore_pending:
             self._explore_pending = False
@@ -652,25 +716,34 @@ class MainWindow(QMainWindow):
         """Twice a second: overview, spectrum, levels, noise report, transport."""
         buf = self._display_buffer()
         if self.overview.isVisible() and buf is not None and len(buf):
-            snap = buf.latest()
+            snap = buf.envelope(None, None, 750)
             if len(snap) and snap.y.shape[1]:
-                xd, yd = minmax_decimate(snap.x, snap.y[:, :1], 1500)
-                self.overview.set_data(xd, yd[:, 0])
+                self.overview.set_data(snap.x, snap.y[:, 0])
             self.overview.set_region(*self.time_plot.viewRange()[0])
         a = self.analyzer
         if a is not None:
-            if self.spec_plot.isVisible():
-                self._refresh_spectrum(a)
-            if self.levels_plot.isVisible() and a.long_levels.count:
-                t, v = a.long_levels.latest(a.long_levels.count)
-                self.levels_plot.set_data(t, v, a.offset_db, a.units,
-                                          self.acoustics.band() is not None)
-                st = self.acoustics.settings()
-                self.levels_plot.set_alarm(st.floor_alarm_db if st.floor_alarm else None)
+            now = time.perf_counter()
+            if now - self._bands_t >= 1.0:  # these change once per integration interval
+                self._bands_t = now
+                if self.spec_plot.isVisible():
+                    self._refresh_spectrum(a)
+                if self.tol_plot.isVisible():
+                    self._refresh_tol(a)
+            if self.levels_plot.isVisible() and a.intervals is not None and a.intervals.count:
+                self._refresh_levels(a)
             self.acoustics.show_report(a.report, a.alarm)
             self.alarm_label.setText("⚠ NOISE FLOOR ALARM" if a.alarm else "")
             self.alarm_label.setStyleSheet("color:#ff5050; font-weight:bold;" if a.alarm else "")
         src = self.source
+        ov = self.rec_overview
+        if isinstance(src, AudioFileSource) and ov is not None:
+            if not ov.complete or not self._ov_final:
+                self._ov_final = ov.complete
+                start = src.segments[0].wall_start
+                label = (dt.datetime.fromtimestamp(start).strftime("%Y-%m-%d %H:%M:%S") + " · "
+                         if start else "") + f"{len(src.segments)} file(s), {src.duration / 60:.1f} min"
+                self.rec_view.set_overview(ov, a.offset_db if a else 0.0, label)
+            self.rec_view.set_position(src.position, self.time_plot.viewRange()[0])
         if isinstance(src, AudioFileSource):
             if not self._seeking and src.duration:
                 self.tr_slider.blockSignals(True)
@@ -682,6 +755,21 @@ class MainWindow(QMainWindow):
     def _refresh_live(self, buf: RingBuffer) -> None:
         samples_axis = self.xaxis.currentData() == "samples"
         triggered = self.mode.currentData() == "trigger"
+        if not samples_axis and not triggered:  # common case: draw an envelope, no big copy
+            last = buf.last_x()
+            if last is None:
+                return
+            span = self.window_s.value()
+            snap = buf.envelope(last - span, last, 2 * max(200, self.time_plot.width()))
+            if not len(snap):
+                return
+            self._update_channel_list(snap.names)
+            self._show_series(snap.x, snap.y, snap.names)
+            self.time_plot.setXRange(last - span, last, padding=0)
+            self._apply_y_range()
+            self._update_readout(snap.names, snap.y)
+            self._trigger_waiting = False
+            return
         if samples_axis:
             span = float(self.window_n.value())
             snap = buf.latest(int(span) * (2 if triggered else 1))
@@ -733,7 +821,7 @@ class MainWindow(QMainWindow):
             snap = buf.from_index(i0, max_n=max(0, int(np.ceil(x1)) - i0 + 1))
             x = snap.first_index + np.arange(len(snap), dtype=float)
         else:
-            snap = buf.range(x0, x1)
+            snap = buf.envelope(x0, x1, 2 * max(200, self.time_plot.width()))
             x = snap.x
         if len(snap):
             self._show_series(x, snap.y, snap.names)
@@ -758,13 +846,20 @@ class MainWindow(QMainWindow):
             floor = a.floor_snapshot()
             if floor is not None:
                 d = d - floor[1]
-        else:
+        elif not a.external:
             df = a.rate / a.nfft
             d = d + a.offset_db - 10 * np.log10(df)  # power per bin -> spectral density
-        nyq = a.rate / 2
+        nyq = float(a.freqs[-1]) if a.external else a.rate / 2
         f_max = self.f_max.value() or nyq
-        bins = int(np.searchsorted(a.freqs, min(f_max, nyq), side="right"))
-        img = d[:, :max(bins, 2)].T
+        bins = max(int(np.searchsorted(a.freqs, min(f_max, nyq), side="right")), 2)
+        img = d[:, :bins].T
+        freqs = a.freqs[:bins]
+        rows_max = 2 * max(100, self.spectro.height())
+        if img.shape[0] > rows_max and not self.spec_log.isChecked():  # keep peaks
+            step = int(np.ceil(img.shape[0] / rows_max))
+            m = (img.shape[0] // step) * step
+            img = img[:m].reshape(-1, step, img.shape[1]).max(axis=1)
+            freqs = freqs[:m].reshape(-1, step).mean(axis=1)
         if self.db_auto.isChecked() or self.spec_snr.isChecked():
             hi = float(np.percentile(img, 99.7))
             lo = hi - self.db_range.value() if not self.spec_snr.isChecked() else 0.0
@@ -774,8 +869,8 @@ class MainWindow(QMainWindow):
             hi = float(np.max(img))
             lo = hi - self.db_range.value()
         half = a.hop / a.rate / 2
-        self.spectro.set_image(t[0] - half, t[-1] + half, float(a.freqs[max(bins, 2) - 1]), img,
-                               (lo, hi))
+        self.spectro.set_log_freq(self.spec_log.isChecked(), self.f_min_log.value())
+        self.spectro.set_image(t[0] - half, t[-1] + half, freqs, img, (lo, hi))
         band = self.acoustics.band()
         if band is not None:
             lo_b, hi_b = band.edges(a.rate)
@@ -783,25 +878,63 @@ class MainWindow(QMainWindow):
         else:
             self.spectro.set_band(None, None)
 
+    def _psd_units(self, a: Analyzer) -> str:
+        return "dB re 1 µPa²/Hz" if a.settings.calibration.enabled else "dBFS²/Hz"
+
     def _refresh_spectrum(self, a: Analyzer) -> None:
-        if a.spectro is None or not a.spectro.count:
+        ring = a.psd_series
+        key = (id(ring), ring.head if ring else None, self.psd_pct.isChecked(), a.offset_db)
+        if key == self._psd_key:  # nothing new since the last interval
             return
-        n = max(1, int(0.25 / max(a.hop / a.rate, 1e-6)))
-        _t, d = a.spectro.latest(n)
-        if not len(d):
+        self._psd_key = key
+        latest = a.latest_psd()
+        if latest is None:
             return
-        db = 10 * np.log10(np.mean(10 ** (d / 10), axis=0)) + a.offset_db
-        alpha = self.fft_avg.value()
-        prev = self._spec_avg.get("live")
-        if prev is not None and prev.shape == db.shape:
-            db = alpha * prev + (1 - alpha) * db
-        self._spec_avg["live"] = db
-        freqs = a.freqs[1:]
-        self.spec_plot.curve("level").setData(freqs, db[1:])
+        freqs, psd = latest
+        off = a.offset_db
+        pct = ({k: v + off for k, v in a.psd_percentiles().items()}
+               if self.psd_pct.isChecked() else {})
         floor = a.floor_snapshot()
-        if floor is not None:
-            self.spec_plot.floor_curve.setData(freqs, floor[1][1:] + a.offset_db)
-        self.spec_plot.setLabel("left", "Level", units=f"{a.units} per bin")
+        floor_f = floor_db = None
+        if floor is not None and a.rate:  # analysis floor is per bin: convert to per Hz
+            floor_f, floor_db = floor[0], floor[1] + off - 10 * np.log10(a.rate / a.nfft)
+        self.spec_plot.set_psd(freqs, psd + off, pct, floor_f, floor_db, self._psd_units(a))
+
+    def _refresh_tol(self, a: Analyzer) -> None:
+        ring = a.tol_series
+        key = (id(ring), ring.head if ring else None, a.offset_db, self.acoustics.tol_bands())
+        if key == self._tol_key:
+            return
+        self._tol_key = key
+        t, levels = a.tol_window()
+        if not len(t) or not a.tol_bands:
+            return
+        off = a.offset_db
+        pct = {}
+        if len(t) >= 3:
+            pct = {k: v + off for k, v in percentiles_db(levels, axis=0).items()}
+        resolved = [band_resolution_ok(a.psd_freqs, b) for b in a.tol_bands]
+        self.tol_plot.set_levels(a.tol_bands, levels[-1] + off, pct,
+                                 self.acoustics.tol_bands(), resolved, a.units)
+
+    def _refresh_levels(self, a: Analyzer) -> None:
+        key = (id(a.intervals), a.intervals.head, a.offset_db, self.peak_on.isChecked(),
+               self.acoustics.tol_bands(), self.acoustics.band() is not None)
+        if key == self._levels_key:
+            return
+        self._levels_key = key
+        t, v = a.intervals.latest(a.intervals.count)
+        chosen = self.acoustics.tol_bands()
+        bands = {}
+        if chosen and a.tol_series is not None and a.tol_series.count:
+            tt, tol = a.tol_series.latest(a.tol_series.count)
+            index = {b.label: i for i, b in enumerate(a.tol_bands)}
+            if len(tt) == len(t):
+                bands = {name: tol[:, index[name]] for name in chosen if name in index}
+        self.levels_plot.set_data(t, v, a.offset_db, a.units, self.acoustics.band() is not None,
+                                  self.peak_on.isChecked(), bands)
+        st = self.acoustics.settings()
+        self.levels_plot.set_alarm(st.floor_alarm_db if st.floor_alarm else None)
 
     def _refresh_screen(self, src: ScreenSource) -> None:
         frame = src.latest
@@ -985,13 +1118,16 @@ class MainWindow(QMainWindow):
         self.spectro.clear_selection()
         self._sel = (t0, t1, None, None)
 
-    def _spectro_select(self, x0, x1, f0, f1, finished) -> None:
+    def _spectro_select(self, x0, x1, y0, y1, finished) -> None:
         self._enter_explore()
         t0, t1 = sorted((x0, x1))
+        f0, f1 = self.spectro.inv_fy(y0), self.spectro.inv_fy(y1)
         lo, hi = sorted((max(0.0, f0), max(0.0, f1)))
         self.spectro.set_selection(t0, t1, lo, hi)
         self.time_plot.set_selection(t0, t1)
         self._sel = (t0, t1, lo, hi)
+        if finished and self.auto_detail.isChecked() and t1 > t0:
+            self.analyse_selection()
 
     def _selection_dragged(self) -> None:
         span = self.time_plot.selected_span()
@@ -1018,7 +1154,10 @@ class MainWindow(QMainWindow):
         return self._sel
 
     def _clip(self, t0: float, t1: float, all_channels: bool = False):
-        """``(clip, rate, t_start)`` from the raw history, or None."""
+        """``(clip, rate, t_start)`` from the raw history, a spectrogram patch
+        dict for screen spectrograms, or None."""
+        if self.analyzer is not None and self.analyzer.external and not all_channels:
+            return self.analyzer.patch(t0, t1)
         if self.buffer is None:
             return None
         snap = self.buffer.range(t0, t1)
@@ -1033,6 +1172,34 @@ class MainWindow(QMainWindow):
         mono = self.analyzer.channel_signal(snap.y) if self.analyzer else snap.y[:, 0]
         return mono, float(rate), float(snap.x[0])
 
+    def analyse_selection(self) -> None:
+        sel = self._need_selection()
+        if sel is None or self.buffer is None:
+            return
+        t0, t1, lo, hi = sel
+        snap = self.buffer.range(t0, t1)
+        rate = (self.analyzer.rate if self.analyzer and self.analyzer.rate
+                else self.buffer.sample_rate)
+        if len(snap) < 16 or not rate:
+            QMessageBox.information(self, APP_NAME, "Not enough data in that selection.")
+            return
+        band = (lo, hi) if lo is not None else None
+        if band is None and self.acoustics.band() is not None:
+            band = self.acoustics.band().edges(rate)
+        cal = self.acoustics.calibration()
+        floor = self.analyzer.floor_snapshot() if self.analyzer else None
+
+        def identify(clip, r, a, b, bnd):
+            lo_, hi_ = bnd if bnd else estimate_band(clip, r, *(floor or (None, None)))
+            self._identify(clip, r, lo_, hi_, "", a, b, floor)
+
+        win = SelectionDetail(self, snap.x, snap.y, snap.names, rate, cal.offset_db,
+                              cal.enabled, band, self._wall_clock(float(snap.x[0])),
+                              play=lambda y, r, t: self._play_clip(y, r, t),
+                              identify=identify,
+                              save_event=lambda a, b: self._save_event(a, b, "selection"))
+        win.show()
+
     def identify_selection(self) -> None:
         sel = self._need_selection()
         if sel is None:
@@ -1043,11 +1210,40 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_NAME, "That part of the history is no longer "
                                     "in memory.")
             return
-        clip, rate, _ = got
+        clip, rate, _ = self._unpack(got)
         floor = self.analyzer.floor_snapshot() if self.analyzer else None
         if lo is None:
-            lo, hi = estimate_band(clip, rate, *(floor or (None, None)))
+            lo, hi = self._band_of(clip, rate, floor)
         self._identify(clip, rate, lo, hi, "", t0, t1, floor)
+
+    # -- audio clips vs spectrogram patches (screen) ------------------------------
+    @staticmethod
+    def _unpack(got):
+        """Detection/selection data -> (data, rate, t_start); data is a mono
+        clip, or a spectrogram patch dict (rate None) for screen spectrograms."""
+        if isinstance(got, dict):
+            return got, None, float(got["times"][0]) if len(got["times"]) else 0.0
+        return got
+
+    @staticmethod
+    def _band_of(data, rate, floor) -> tuple[float, float]:
+        if isinstance(data, dict):
+            snr = np.nan_to_num(data["db"] - data["floor"][None, :]).max(axis=0)
+            rows = np.flatnonzero(snr > 6)
+            f = data["freqs"]
+            return (float(f[rows[0]]), float(f[rows[-1]])) if len(rows) else (float(f[0]),
+                                                                              float(f[-1]))
+        return estimate_band(data, rate, *(floor or (None, None)))
+
+    def _add_example(self, label, data, rate, f_lo, f_hi, kind="positive", method="auto",
+                     category="", notes="", source=None, floor=None):
+        source = source or self._source_desc()
+        if isinstance(data, dict):
+            return self.library.add_patch_example(label, data["freqs"], data["frame_period"],
+                                                  data["db"], data["floor"], f_lo, f_hi, kind,
+                                                  category, notes, source)
+        return self.library.add_example(label, data, rate, f_lo, f_hi, kind, method, category,
+                                        notes, source, floor)
 
     def _identify(self, clip, rate, lo, hi, suggested, t0, t1, floor,
                   det: Detection | None = None) -> str | None:
@@ -1057,9 +1253,9 @@ class MainWindow(QMainWindow):
             return None
         v = dlg.values()
         try:
-            sig, _ex = self.library.add_example(
+            sig, _ex = self._add_example(
                 v["label"], clip, rate, v["f_lo"], v["f_hi"], "positive", v["method"],
-                v["category"], v["notes"], self._source_desc(), floor)
+                v["category"], v["notes"], floor=floor)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, APP_NAME, f"Could not save the signature:\n{exc}")
             return None
@@ -1172,10 +1368,15 @@ class MainWindow(QMainWindow):
         det_info = [{"id": d.id, "t0": d.t0, "t1": d.t1, "text": d.text, "status": d.status,
                      "label": d.label, "score": round(d.score, 3), "f_lo": d.f_lo,
                      "f_hi": d.f_hi} for d in (dets or [])]
+        extra = None
+        if self.analyzer is not None and self.analyzer.external:
+            patch = self.analyzer.patch(t0, t1)
+            if patch is not None:
+                extra = {"spectrogram.npz": patch}
         try:
             rec = self.store.add(snap.x, snap.y, snap.names, buf.sample_rate, kind, title,
                                  tags, notes, self._source_desc(),
-                                 self._wall_clock(float(snap.x[0])), det_info)
+                                 self._wall_clock(float(snap.x[0])), det_info, extra)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, APP_NAME, f"Could not save the event:\n{exc}")
             return
@@ -1253,8 +1454,8 @@ class MainWindow(QMainWindow):
         sig = self.library.get(det.sig_id) if det.sig_id else None
         if got is None or sig is None:
             return
-        clip, rate, t_start = got
-        self.library.add_example(sig.label, clip, rate, det.f_lo, det.f_hi, "positive",
+        clip, rate, t_start = self._unpack(got)
+        self._add_example(sig.label, clip, rate, det.f_lo, det.f_hi, "positive",
                                  source=self._source_desc(),
                                  floor=self.analyzer.floor_snapshot())
         sig.confirmed += 1
@@ -1271,17 +1472,17 @@ class MainWindow(QMainWindow):
         got = self._det_clip(det)
         if got is None:
             return
-        clip, rate, t_start = got
+        clip, rate, t_start = self._unpack(got)
         new_label = ask_label(self, self.library.labels(), "Correct detection",
                               "What is it really? (pick or type a new name)", det.label or "")
         if not new_label:
             return
         floor = self.analyzer.floor_snapshot()
-        self.library.add_example(new_label, clip, rate, det.f_lo, det.f_hi, "positive",
+        self._add_example(new_label, clip, rate, det.f_lo, det.f_hi, "positive",
                                  source=self._source_desc(), floor=floor)
         old = self.library.get(det.sig_id) if det.sig_id else None
         if old is not None and old.label.lower() != new_label.lower():
-            self.library.add_example(old.label, clip, rate, det.f_lo, det.f_hi, "negative",
+            self._add_example(old.label, clip, rate, det.f_lo, det.f_hi, "negative",
                                      source=self._source_desc(), floor=floor)
             old.rejected += 1
             self.library.update(old)
@@ -1301,8 +1502,8 @@ class MainWindow(QMainWindow):
         if sig is not None:
             got = self._det_clip(det)
             if got is not None:
-                clip, rate, _ = got
-                self.library.add_example(sig.label, clip, rate, det.f_lo, det.f_hi, "negative",
+                clip, rate, _ = self._unpack(got)
+                self._add_example(sig.label, clip, rate, det.f_lo, det.f_hi, "negative",
                                          source=self._source_desc(),
                                          floor=self.analyzer.floor_snapshot())
                 sig.rejected += 1
@@ -1316,18 +1517,18 @@ class MainWindow(QMainWindow):
         got = self._det_clip(det)
         if got is None:
             return
-        clip, rate, t_start = got
+        clip, rate, t_start = self._unpack(got)
         suggested = det.label or (det.alternatives[0][1] if det.alternatives else "")
         floor = self.analyzer.floor_snapshot()
-        lo, hi = (det.f_lo, det.f_hi) if det.f_hi > det.f_lo else estimate_band(
-            clip, rate, *(floor or (None, None)))
+        lo, hi = (det.f_lo, det.f_hi) if det.f_hi > det.f_lo else self._band_of(clip, rate,
+                                                                                floor)
         old_label = det.label
         label = self._identify(clip, rate, lo, hi, suggested, det.t0, det.t1, floor, det)
         if label is None:
             return
         old = self.library.get(det.sig_id) if det.sig_id else None
         if old is not None and old_label and old_label.lower() != label.lower():
-            self.library.add_example(old.label, clip, rate, det.f_lo, det.f_hi, "negative",
+            self._add_example(old.label, clip, rate, det.f_lo, det.f_hi, "negative",
                                      source=self._source_desc(), floor=floor)
             old.rejected += 1
             self.library.update(old)
@@ -1343,7 +1544,10 @@ class MainWindow(QMainWindow):
         if det is None:
             return
         got = self._det_clip(det)
-        if got is not None:
+        if isinstance(got, dict):
+            QMessageBox.information(self, APP_NAME, "There is no audio behind a spectrogram "
+                                    "read from the screen.")
+        elif got is not None:
             self._play_clip(*got)
 
     def show_detection(self, det_id: int) -> None:
@@ -1362,6 +1566,11 @@ class MainWindow(QMainWindow):
             tags = [det.label] if det.label else []
             self._save_event(det.t0 - 0.5, det.t1 + 0.5, "detection", det.label or "", tags,
                              dets=[det])
+
+    def batch_analysis(self) -> None:
+        from aquafonix.ui.batch_dialog import BatchDialog
+
+        BatchDialog(self, self.acoustics).exec()
 
     def manage_signatures(self) -> None:
         dlg = SignatureManager(self, self.library,
@@ -1400,6 +1609,9 @@ class MainWindow(QMainWindow):
         self.db_range.setEnabled(not self.spec_snr.isChecked())
         self.spec_plot.setVisible(self.spectrum_on.isChecked())
         self.spec_plot.setLogMode(x=self.fft_log.isChecked(), y=False)
+        self.tol_plot.setVisible(self.tol_on.isChecked())
+        self.bottom_split.setVisible(self.spectrum_on.isChecked() or self.tol_on.isChecked())
+        self.f_min_log.setEnabled(self.spec_log.isChecked())
         self.levels_plot.setVisible(self.levels_on.isChecked())
         self.overview.setVisible(self.overview_on.isChecked())
         self._update_axis_label()
@@ -1407,7 +1619,75 @@ class MainWindow(QMainWindow):
         self._explore_pending = True
         self._apply_y_range()
 
+    def _db_auto_toggled(self, on: bool) -> None:
+        if on:
+            self.spectro.manual_levels = None
+        self._explore_pending = True
+
+    def _hover(self, plot, scene_pos) -> None:
+        vb = plot.getPlotItem().vb
+        if not vb.sceneBoundingRect().contains(scene_pos):
+            return
+        p = vb.mapSceneToView(scene_pos)
+        x, y = p.x(), p.y()
+        text = ""
+        a = self.analyzer
+        if plot is self.spectro:
+            f = self.spectro.inv_fy(y)
+            v = self.spectro.value_at(x, y)
+            unit = "dB re floor" if self.spec_snr.isChecked() else (
+                self._psd_units(a) if a else "dB")
+            text = f"t {x:.3f} s · f {f:,.1f} Hz" + (f" · {v:.1f} {unit}" if v is not None else "")
+            self.spectro.cursor.setValue(x)
+        elif plot is self.time_plot:
+            text = f"t {x:.4f} s · y {y:.6g}"
+            self.spectro.cursor.setValue(x)
+        elif plot is self.levels_plot:
+            text = f"t {x:.1f} s · {y:.1f} {a.units if a else 'dB'}"
+        else:
+            got = plot.value_at(x, y)
+            text = got or ""
+        self.cursor_label.setText(text)
+
+    def _apply_file_calibration(self, path: str) -> None:
+        """Calibration for a recording: its metadata, else what was last used
+        for files in the same folder."""
+        from aquafonix.acoustics.calibration_io import find_calibration
+
+        if self.acoustics.cal_auto.isChecked():
+            hint = find_calibration(path)
+            if hint is not None:
+                self.acoustics.apply_calibration(*hint.values(), hint.describe())
+                self.statusBar().showMessage(f"Calibration: {hint.describe()}", 8000)
+                return
+        import json
+
+        folder = str(Path(path).resolve().parent)
+        try:
+            remembered = json.loads(self.settings.value("calibration/folders", "{}") or "{}")
+        except ValueError:
+            remembered = {}
+        cal = remembered.get(folder)
+        if cal and cal.get("enabled"):
+            self.acoustics.apply_calibration(cal["sensitivity_db"], cal["gain_db"],
+                                             cal["full_scale_v"], "the last files in this folder")
+
+    def _remember_folder_calibration(self) -> None:
+        src = self.source
+        if not isinstance(src, AudioFileSource):
+            return
+        import json
+
+        folder = str(Path(src.path).resolve().parent)
+        try:
+            remembered = json.loads(self.settings.value("calibration/folders", "{}") or "{}")
+        except ValueError:
+            remembered = {}
+        remembered[folder] = self.acoustics.calibration_values()
+        self.settings.setValue("calibration/folders", json.dumps(remembered))
+
     def _acoustics_changed(self) -> None:
+        self._remember_folder_calibration()
         if self.analyzer is not None:
             self.analyzer.apply(self.acoustics.settings())
         self._last_version = -1
@@ -1465,8 +1745,15 @@ class MainWindow(QMainWindow):
         self._seeking = False
         src = self.source
         if isinstance(src, AudioFileSource):
-            src.seek(self.tr_slider.value() / 10000 * src.duration)
+            self._seek_to(self.tr_slider.value() / 10000 * src.duration)
+
+    def _seek_to(self, t: float) -> None:
+        src = self.source
+        if isinstance(src, AudioFileSource):
+            src.seek(t)
             self._reset_view()
+            if self.explore:
+                self.act_pause.setChecked(False)
 
     def _transport_speed(self) -> None:
         src = self.source
@@ -1525,6 +1812,19 @@ class MainWindow(QMainWindow):
         patch = img[r0:r1, c0:c1].reshape(-1, 3).astype(int)
         dist = ((patch - np.array(frame.result.background)) ** 2).sum(axis=1)
         sp.add_picked_trace(tuple(int(v) for v in patch[int(np.argmax(dist))]))
+
+    def _bar_picked(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        from aquafonix.screen.specread import sample_colour_bar
+
+        frame = self._last_frame
+        if frame is None or not self.screen_panel.pick_bar.isChecked():
+            return
+        colors = sample_colour_bar(frame.image, x0, y0, x1, y1)
+        if len(colors) < 2:
+            QMessageBox.information(self, APP_NAME, "Drag a box along the colour bar.")
+            return
+        self.screen_panel.set_bar_colors(colors)
+        self.preview.set_rect_pick(False)
 
     def _autodetect_traces(self, count: int) -> None:
         frame = self._last_frame
@@ -1692,6 +1992,8 @@ class MainWindow(QMainWindow):
         self.player.stop()
         self.stop()
         self._stop_analyzer()
+        if self.rec_overview is not None:
+            self.rec_overview.stop()
         self.outline.close()
         if self.persist:
             self.save_settings()
