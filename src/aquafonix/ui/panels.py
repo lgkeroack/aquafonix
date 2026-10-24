@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFormLayout, Q
 
 from aquafonix.parsing import BINARY_TYPES, ParserConfig
 from aquafonix.screen.capture import OUTPUTS, Region, ScreenSource
+from aquafonix.screen.specread import COLOUR_SCALES, ORIENTATIONS, ColourScale
 from aquafonix.screen.extract import (ESTIMATORS, MAX_TRACES, MODES, PROBES, Calibration,
                                       TraceDef, TraceSettings)
 from aquafonix.sources import (FileTailSource, GeneratorSource, SerialSource, Source,
@@ -177,13 +178,16 @@ class AudioFilePanel(SourcePanel):
         f = self.form()
         row = QHBoxLayout()
         self.path = named(QLineEdit(), "audiofile.path")
-        self.path.setPlaceholderText("WAV / FLAC / AIFF hydrophone recording")
+        self.path.setPlaceholderText("file, folder, or files separated by ;")
         self.path.editingFinished.connect(self._update_info)
-        browse = QToolButton(text="…", toolTip="Browse")
+        browse = QToolButton(text="Files…", toolTip="Choose one or more recordings")
         browse.clicked.connect(self._browse)
+        folder = QToolButton(text="Folder…", toolTip="Play every recording in a folder, in order")
+        folder.clicked.connect(self._browse_folder)
         row.addWidget(self.path, 1)
         row.addWidget(browse)
-        f.addRow("File", row)
+        row.addWidget(folder)
+        f.addRow("Recording", row)
         self.info = QLabel("")
         f.addRow("", self.info)
         self.speed = named(combo(self.SPEEDS, "1"), "audiofile.speed")
@@ -191,15 +195,22 @@ class AudioFilePanel(SourcePanel):
         self.loop = named(QCheckBox("Loop"), "audiofile.loop")
         f.addRow(self.loop)
         self.layout_.addWidget(_hint(
-            "Replays the file through everything else (spectrogram, detection, events). "
-            "Use the transport bar above the plots to pause, seek or change speed. "
-            "<b>Scan</b> runs detection over the whole file as fast as possible."))
+            "Replays the recording through everything else (spectrogram, levels, detection, "
+            "events). Several files or a folder play as one continuous recording, with times "
+            "taken from the file names. Click the overview above the waveform to jump; "
+            "<b>Scan</b> runs detection over everything as fast as possible."))
 
     def _browse(self) -> None:
         from aquafonix.audiofile import OPEN_FILTER
 
-        path, _ = QFileDialog.getOpenFileName(self, "Open recording", self.path.text(),
-                                              OPEN_FILTER)
+        paths, _ = QFileDialog.getOpenFileNames(self, "Open recording(s)",
+                                                self.path.text().split(";")[0], OPEN_FILTER)
+        if paths:
+            self.set_path(";".join(paths))
+
+    def _browse_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Folder of recordings",
+                                                self.path.text().split(";")[0])
         if path:
             self.set_path(path)
 
@@ -208,15 +219,24 @@ class AudioFilePanel(SourcePanel):
         self._update_info()
 
     def _update_info(self) -> None:
-        from aquafonix import audiofile
+        import datetime as dt
 
-        path = self.path.text().strip()
-        if not path:
+        from aquafonix.sources.audiofile import expand_paths, scan_recording
+
+        spec = self.path.text().strip()
+        if not spec:
             self.info.setText("")
             return
         try:
-            i = audiofile.info(path)
-            self.info.setText(f"{i.duration:.1f} s · {i.sample_rate:g} Hz · {i.channels} ch")
+            segs, rate, ch, skipped = scan_recording(expand_paths(spec))
+            total = (segs[-1].start + segs[-1].frames) / rate
+            text = (f"{len(segs)} file(s) · {total / 60:.1f} min · {rate:g} Hz · {ch} ch")
+            if segs[0].wall_start:
+                text += " · starts " + dt.datetime.fromtimestamp(segs[0].wall_start).strftime(
+                    "%Y-%m-%d %H:%M:%S")
+            if skipped:
+                text += f" · skipped {len(skipped)} (different format)"
+            self.info.setText(text)
         except Exception as exc:
             self.info.setText(f"can't read: {exc}")
 
@@ -443,6 +463,40 @@ class ScreenPanel(SourcePanel):
         self.detected.setTextFormat(Qt.RichText)
         f.addRow("Found", self.detected)
         self._det_form = f
+        self._det_box = f.parentWidget()
+
+        # reading a spectrogram image
+        f = self.form("Spectrogram colours")
+        self._spec_box = f.parentWidget()
+        self.scale = named(combo(COLOUR_SCALES, "inferno"), "screen.scale")
+        f.addRow("Colour scale", self.scale)
+        self.pick_bar = QPushButton("Pick the colour bar in the preview")
+        self.pick_bar.setCheckable(True)
+        self.pick_bar.setToolTip("Then drag a box over the other program's colour bar "
+                                 "(low end at the bottom or left)")
+        f.addRow(self.pick_bar)
+        self.bar_info = QLabel("")
+        f.addRow(self.bar_info)
+        self._bar_state = named(QLineEdit(), "screen.barcolors")
+        self._bar_state.setVisible(False)
+        self.layout_.addWidget(self._bar_state)
+        self.scale_lo = named(spin(-1e4, 1e4, 0, decimals=1, suffix=" dB"), "screen.scalelo")
+        self.scale_hi = named(spin(-1e4, 1e4, 100, decimals=1, suffix=" dB"), "screen.scalehi")
+        lrow = QHBoxLayout()
+        lrow.addWidget(self.scale_lo)
+        lrow.addWidget(QLabel("to"))
+        lrow.addWidget(self.scale_hi)
+        f.addRow("Colour bar range", lrow)
+        self.scale_tol = named(spin(4, 200, 40), "screen.scaletol")
+        self.scale_tol.setToolTip("How far a pixel's colour may be from the scale and still "
+                                  "count (text and grid lines are ignored)")
+        f.addRow("Colour tolerance", self.scale_tol)
+        self.orientation = named(combo(ORIENTATIONS, "right"), "screen.orientation")
+        f.addRow("Layout", self.orientation)
+        f.addRow(_hint("Select only the image area (no axes). Put the A/B lines on two "
+                       "known <b>frequencies</b> and type them in Hz (Y lines; X lines for a "
+                       "vertical waterfall). Detection, identification and the spectrogram "
+                       "view then work on what the other program shows."))
         trow = QHBoxLayout()
         self.tolerance = named(QSlider(Qt.Horizontal), "screen.tolerance")
         self.tolerance.setRange(5, 250)
@@ -499,8 +553,12 @@ class ScreenPanel(SourcePanel):
         save.clicked.connect(self.save_trace_requested)
         f.addRow(save)
 
-        for w in (self.mode, self.estimator, self.output, self.probe):
+        for w in (self.mode, self.estimator, self.output, self.probe, self.scale,
+                  self.orientation):
             w.currentIndexChanged.connect(self._changed)
+        for w in (self.scale_lo, self.scale_hi, self.scale_tol):
+            w.valueChanged.connect(self._changed)
+        self._bar_state.textChanged.connect(self._bar_loaded)
         for w in (self.ignore_grid, self.bridge, self.log_y, self.outline, self.show_mask):
             w.toggled.connect(self._changed)
         for w in (self.fps, self.probe_col, *self.cal_val.values()):
@@ -602,6 +660,30 @@ class ScreenPanel(SourcePanel):
                 defs.append(TraceDef(name, (c.red(), c.green(), c.blue())))
         self.set_trace_defs(defs)
 
+    def colour_scale(self) -> ColourScale:
+        return ColourScale(self.scale.currentData(), self._bar_colors(),
+                           self.scale_lo.value(), self.scale_hi.value(),
+                           float(self.scale_tol.value()))
+
+    def _bar_colors(self) -> tuple:
+        out = []
+        for part in self._bar_state.text().split(","):
+            c = QColor(part.strip())
+            if c.isValid():
+                out.append((c.red(), c.green(), c.blue()))
+        return tuple(out)
+
+    def set_bar_colors(self, colors) -> None:
+        self.pick_bar.setChecked(False)
+        self._bar_state.setText(",".join(f"#{r:02x}{g:02x}{b:02x}" for r, g, b in colors))
+        self.scale.setCurrentIndex(self.scale.findData("bar"))
+        self._bar_loaded()
+        self._changed()
+
+    def _bar_loaded(self, *_args) -> None:
+        n = len(self._bar_colors())
+        self.bar_info.setText(f"Colour bar: {n} colours sampled" if n else "")
+
     def trace_settings(self) -> TraceSettings:
         return TraceSettings(mode=self.mode.currentData(), traces=tuple(self.trace_defs()),
                              tolerance=float(self.tolerance.value()),
@@ -641,9 +723,12 @@ class ScreenPanel(SourcePanel):
         region = self.region()
         if region is None:
             raise ValueError("Select a screen region first.")
-        return ScreenSource(region, self.fps.value(), self.trace_settings(),
-                            self.output.currentData(), self.probe.currentData(),
-                            self.probe_col.value() / 100.0)
+        src = ScreenSource(region, self.fps.value(), self.trace_settings(),
+                           self.output.currentData(), self.probe.currentData(),
+                           self.probe_col.value() / 100.0)
+        src.colour_scale = self.colour_scale()
+        src.orientation = self.orientation.currentData()
+        return src
 
     def apply_to(self, source: Source) -> None:
         if not isinstance(source, ScreenSource):
@@ -656,6 +741,8 @@ class ScreenPanel(SourcePanel):
         source.output = self.output.currentData()
         source.probe = self.probe.currentData()
         source.probe_column = self.probe_col.value() / 100.0
+        source.colour_scale = self.colour_scale()
+        source.orientation = self.orientation.currentData()
 
     # -- internals ------------------------------------------------------------
     def _region_edited(self) -> None:
@@ -678,6 +765,9 @@ class ScreenPanel(SourcePanel):
         self._out_form.setRowVisible(self.probe_col, self.probe.currentData() == "column")
         self._out_form.setRowVisible(self.probe, self.output.currentData() != "stitch")
         self.traces.setEnabled(self.mode.currentData() == "colors")
+        spec = self.output.currentData() == "spectrogram"
+        self._spec_box.setVisible(spec)
+        self._det_box.setVisible(not spec)
 
 
 PANELS = (AudioPanel, AudioFilePanel, SerialPanel, NetworkPanel, FilePanel, ScreenPanel,

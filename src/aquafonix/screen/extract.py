@@ -359,10 +359,27 @@ def shift_errors(prev: np.ndarray, cur: np.ndarray, max_shift: int,
     return errs
 
 
+def shift_errors_2d(prev: np.ndarray, cur: np.ndarray, max_shift: int,
+                    min_overlap: int) -> np.ndarray:
+    """Like :func:`shift_errors` for images (rows, W): mean |difference| over
+    all rows for each horizontal shift.  Used for scrolling spectrograms."""
+    w = cur.shape[1]
+    max_shift = max(0, min(max_shift, w - 1))
+    errs = np.full(max_shift + 1, np.inf)
+    for s in range(max_shift + 1):
+        d = np.abs(cur[:, :w - s] - prev[:, s:])
+        ok = np.isfinite(d)
+        n_cols = ok.any(axis=0).sum()
+        if n_cols >= min_overlap:
+            errs[s] = float(d[ok].mean())
+    return errs
+
+
 class ScrollStitcher:
     """Rebuilds the full history of a chart that scrolls right-to-left by
-    measuring how far the trace moved between frames and keeping only the
-    newly revealed columns."""
+    measuring how far the picture moved between frames and keeping only the
+    newly revealed columns.  The reference is a trace (W,) or an image
+    (rows, W) such as a decoded spectrogram."""
 
     def __init__(self, max_shift: int = 256, min_overlap_frac: float = 0.25,
                  ambiguity_px: float = 0.75, max_error_px: float = 4.0) -> None:
@@ -385,18 +402,19 @@ class ScrollStitcher:
     def update(self, y_px: np.ndarray, values: np.ndarray, t: float):
         """Feed one frame: ``y_px`` (W,) of the reference trace, ``values``
         (W,) or (W, traces).  Returns ``(times, values)`` of new columns."""
-        empty = (np.zeros(0), np.zeros(0))
+        empty = (np.zeros(0), np.zeros((0,) + np.shape(values)[1:]))
         y_px = np.asarray(y_px, dtype=float)
         values = np.asarray(values, dtype=float)
-        if (self._prev_px is None or len(self._prev_px) != len(y_px)
+        if (self._prev_px is None or self._prev_px.shape != y_px.shape
                 or self._prev_val.shape[1:] != values.shape[1:]):
             self.reset()
             self._prev_px, self._prev_val, self._prev_t = y_px, values, t
             self._last_shift_t = t
             return empty
-        w = len(y_px)
-        errs = shift_errors(self._prev_px, y_px, min(self.max_shift, w // 2),
-                            max(2, int(w * self.min_overlap_frac)))
+        w = y_px.shape[-1]
+        errors = shift_errors_2d if y_px.ndim == 2 else shift_errors
+        errs = errors(self._prev_px, y_px, min(self.max_shift, w // 2),
+                      max(2, int(w * self.min_overlap_frac)))
         prev_val, prev_t = self._prev_val, self._prev_t
         self._prev_px, self._prev_val, self._prev_t = y_px, values, t
         if not np.isfinite(errs).any():

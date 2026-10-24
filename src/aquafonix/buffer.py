@@ -228,6 +228,41 @@ class RingBuffer:
             hi = self._logical_at_or_after(np.nextafter(x_max, np.inf))
             return self._copy(lo, max(lo, hi))
 
+    def envelope(self, x_min: float | None, x_max: float | None, buckets: int):
+        """Min/max envelope of ``[x_min, x_max]`` (whole history if None) in
+        about ``buckets`` buckets, computed on the stored samples without
+        copying them: what a plot needs to draw millions of samples.
+        Returns a Snapshot with 2 points per bucket (min, max), or the raw
+        samples when there are fewer than ``2 * buckets``."""
+        with self._lock:
+            lo = 0 if x_min is None else self._logical_at_or_after(x_min)
+            hi = self._count if x_max is None else self._logical_at_or_after(
+                np.nextafter(x_max, np.inf))
+            n = hi - lo
+            if n <= 2 * buckets or buckets < 2:
+                return self._copy(lo, hi)
+            step = int(np.ceil(n / buckets))
+            xs, ys = [], []
+            p0 = (self._start + lo) % self.capacity
+            first = min(n, self.capacity - p0)
+            for seg_lo, seg_n, logical in ((p0, first, lo), (0, n - first, lo + first)):
+                if seg_n <= 0:
+                    continue
+                seg = self._y[seg_lo:seg_lo + seg_n]
+                starts = np.arange(0, seg_n, step)
+                with np.errstate(all="ignore"):
+                    mn = np.fmin.reduceat(seg, starts, axis=0).astype(np.float64)
+                    mx = np.fmax.reduceat(seg, starts, axis=0).astype(np.float64)
+                idx = logical + starts
+                if self.sample_rate:
+                    bx = self.x0 + (self._total - self._count + idx) / self.sample_rate
+                else:
+                    bx = self._x[(self._start + idx) % self.capacity]
+                xs.append(np.repeat(bx, 2))
+                ys.append(np.stack([mn, mx], axis=1).reshape(-1, seg.shape[1]))
+            first_index = self._total - self._count + lo
+            return Snapshot(np.concatenate(xs), np.concatenate(ys), list(self._names), first_index)
+
     def from_index(self, index: int, max_n: int | None = None) -> Snapshot:
         """Samples from absolute ``index`` onwards (clamped to what is held).
         ``snapshot.first_index`` tells the caller where the data really starts."""

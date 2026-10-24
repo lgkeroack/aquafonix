@@ -62,6 +62,7 @@ class Example:
     source: str = ""
     floor_hz: list[float] = field(default_factory=list)
     floor_db: list[float] = field(default_factory=list)
+    data: str = "audio"  # "audio" clip (WAV) or spectrogram "patch" (NPZ)
 
 
 @dataclass
@@ -224,6 +225,50 @@ class SignatureLibrary:
             self.save()
             return sig, ex
 
+    def add_patch_example(self, label: str, freqs: np.ndarray, frame_period: float,
+                          db: np.ndarray, floor: np.ndarray | None, f_lo: float = 0.0,
+                          f_hi: float = 0.0, kind: str = "positive", category: str = "",
+                          notes: str = "", source: str = "") -> tuple[Signature, Example]:
+        """Add a spectrogram patch (frames x freqs, dB) as an example: used
+        when the sound was snipped from a spectrogram read off the screen."""
+        label = label.strip()
+        if not label:
+            raise ValueError("a name is required")
+        db = np.asarray(db, dtype=np.float32)
+        if db.ndim != 2 or db.shape[0] < 1 or db.shape[1] < 3:
+            raise ValueError("the selection is too small")
+        with self._lock:
+            sig = self.find(label)
+            if sig is None:
+                sig = Signature(uuid.uuid4().hex[:12], label, category, notes, "spectral")
+                self.signatures.append(sig)
+            ex_id = uuid.uuid4().hex[:12]
+            self.clips_dir.mkdir(parents=True, exist_ok=True)
+            fname = f"{sig.id}_{ex_id}.npz"
+            floor = np.asarray(floor if floor is not None else np.nanpercentile(db, 20, axis=0),
+                               dtype=np.float32)
+            np.savez_compressed(self.clips_dir / fname, freqs=np.asarray(freqs, np.float32),
+                                frame_period=np.float32(frame_period), db=db, floor=floor)
+            ex = Example(ex_id, fname, 1.0 / max(frame_period, 1e-9), kind, float(f_lo),
+                         float(f_hi), source=source, data="patch")
+            sig.examples.append(ex)
+            same = [e for e in sig.examples if e.kind == kind]
+            while len(same) > MAX_EXAMPLES:
+                victim = same[1]
+                self._delete_example_file(victim)
+                sig.examples.remove(victim)
+                same.remove(victim)
+            self.save()
+            return sig, ex
+
+    def load_patch(self, example: Example) -> dict:
+        cached = self._clip_cache.get(example.id)
+        if cached is None:
+            with np.load(self.clips_dir / example.file) as z:
+                cached = {k: z[k] for k in z.files}
+            self._clip_cache[example.id] = cached
+        return cached
+
     def _delete_example_file(self, ex: Example) -> None:
         self._clip_cache.pop(ex.id, None)
         try:
@@ -360,16 +405,38 @@ class Matcher:
         return sig.label if sig is not None else "?"
 
     def prepare(self, sample_rate: float, nfft: int, hop: int) -> None:
-        key = (self.library.version, round(sample_rate, 3), nfft, hop)
+        self._prepare((self.library.version, round(sample_rate, 3), nfft, hop),
+                      np.fft.rfftfreq(nfft, 1 / sample_rate), hop / sample_rate,
+                      (sample_rate, nfft, hop))
+
+    def prepare_grid(self, freqs: np.ndarray, frame_period: float) -> None:
+        """Templates for spectrogram frames that come from the screen (only
+        patch examples apply: there is no audio to transform)."""
+        self._prepare((self.library.version, "grid", len(freqs), float(freqs[0]),
+                       float(freqs[-1]), round(frame_period, 6)), np.asarray(freqs, float),
+                      frame_period, None)
+
+    def _prepare(self, key, freqs, frame_period, audio) -> None:
         if key == self._key:
             return
         self._key = key
         spectral, shape = [], []
-        freqs = np.fft.rfftfreq(nfft, 1 / sample_rate)
         with self.library._lock:
             sigs = [s for s in self.library.signatures if s.enabled]
         for sig in sigs:
             for ex in sig.examples:
+                if ex.data == "patch":
+                    try:
+                        tpl = self._patch_template(sig, ex, freqs, frame_period)
+                    except Exception:
+                        log.warning("unusable patch for %s/%s", sig.label, ex.id, exc_info=True)
+                        tpl = None
+                    if tpl is not None:
+                        spectral.append(tpl)
+                    continue
+                if audio is None:
+                    continue
+                sample_rate, nfft, hop = audio
                 try:
                     clip, rate = self.library.load_clip(ex)
                 except Exception:
@@ -415,6 +482,35 @@ class Matcher:
             return None
         return SpectralTemplate(sig.id, ex.id, ex.kind, r0, r1, patch / norm,
                                 band.shape[0] * hop / sample_rate)
+
+    def _patch_template(self, sig, ex, freqs, frame_period):
+        """Resample a stored spectrogram patch onto the current grid."""
+        z = self.library.load_patch(ex)
+        pf, pdb, floor = z["freqs"].astype(float), z["db"].astype(float), z["floor"].astype(float)
+        dt_src = float(z["frame_period"])
+        snr = np.clip(np.nan_to_num(pdb - floor[None, :]), 0.0, 40.0)  # (frames, f)
+        on_grid = np.stack([np.interp(freqs, pf, row, left=0.0, right=0.0) for row in snr])
+        n_new = max(1, int(round(len(on_grid) * dt_src / frame_period)))
+        if n_new != len(on_grid):
+            src_t = np.arange(len(on_grid)) * dt_src
+            new_t = np.arange(n_new) * frame_period
+            on_grid = np.stack([np.interp(new_t, src_t, on_grid[:, k])
+                                for k in range(on_grid.shape[1])], axis=1)
+        snr = blur_freq(on_grid, axis=1)
+        hi_hz = ex.f_hi if ex.f_hi > 0 else float(freqs[-1])
+        r0 = int(np.searchsorted(freqs, ex.f_lo, side="left"))
+        r1 = int(np.searchsorted(freqs, hi_hz, side="right"))
+        r0, r1 = max(0, min(r0, len(freqs) - 3)), min(len(freqs), max(r1, r0 + 3))
+        band = snr[:, r0:r1]
+        active = np.flatnonzero(band.mean(axis=1) > 1.5)
+        if len(active):
+            band = band[max(0, active[0] - 1):active[-1] + 2]
+        patch = band.T - band.mean()
+        norm = np.linalg.norm(patch)
+        if norm < 1e-6:
+            return None
+        return SpectralTemplate(sig.id, ex.id, ex.kind, r0, r1, patch / norm,
+                                band.shape[0] * frame_period)
 
     def _shape_template(self, sig, ex, clip, rate, sample_rate):
         n = int(round(len(clip) * sample_rate / rate))

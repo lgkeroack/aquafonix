@@ -15,13 +15,15 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
 
-from aquafonix.acoustics import noise
+from aquafonix.acoustics import metrics, noise
+from aquafonix.acoustics.array import ArrayGeometry, bearing_from_delay, bearing_scan, tdoa
+from aquafonix.acoustics.demon import demon
 from aquafonix.acoustics.filters import BandSpec, StreamingFIR, design_fir
 from aquafonix.acoustics.signatures import DEFAULT_THRESHOLD, Matcher
 from aquafonix.acoustics.spectral import (FloorTracker, auto_nfft, blur_freq, power_frames,
@@ -62,7 +64,7 @@ class AnalysisSettings:
     band: BandSpec | None = None
     detect: bool = True
     event_threshold_db: float = 10.0
-    min_event_s: float = 0.03
+    min_event_s: float = 0.005
     max_event_s: float = 10.0
     detect_in_band: bool = True
     match: bool = True
@@ -70,6 +72,13 @@ class AnalysisSettings:
     floor_alarm: bool = False
     floor_alarm_db: float = 100.0
     stats_window_s: float = 60.0
+    integration_s: float = 1.0  # averaging time for SPL / PSD / third-octave levels
+    psd_nfft: int = 0  # 0 = automatic (~1 Hz resolution, fits the integration time)
+    tol_bands: tuple[str, ...] = ("63 Hz", "125 Hz", "2 kHz")  # bands plotted over time
+    array: ArrayGeometry = ArrayGeometry()  # two hydrophones -> bearings
+    btr_step_s: float = 0.25  # bearing-time record resolution
+    demon: bool = True  # look for propeller modulation (DEMON) in the noise report
+    demon_band: tuple[float, float] | None = None  # None = automatic
 
 
 @dataclass
@@ -88,6 +97,8 @@ class Detection:
     status: str = "unidentified"  # suspected | unidentified | confirmed | corrected | rejected
     wall_time: float | None = None
     saved_event: str | None = None
+    bearing: float | None = None  # degrees from the array axis
+    bearing_q: float = 0.0  # GCC-PHAT peak quality (higher = clearer)
 
     @property
     def text(self) -> str:
@@ -103,6 +114,13 @@ class Detection:
             sid, lab, sc = self.alternatives[0]
             return f"Unidentified (closest: {lab} {sc:.2f})"
         return "Unidentified"
+
+
+def _nbytes(clip) -> int:
+    """Memory held by a detection clip (audio tuple or spectrogram patch)."""
+    if isinstance(clip, dict):
+        return sum(np.asarray(v).nbytes for v in clip.values())
+    return clip[0].nbytes
 
 
 class _Ring:
@@ -201,7 +219,15 @@ class Analyzer:
         self.filtered: RingBuffer | None = None
         self.spectro: _Ring | None = None
         self.levels: _Ring | None = None  # per frame: broadband, floor, band
-        self.long_levels = _Ring(24 * 3600, 5)  # per second: bb, floor, band, 63, 125
+        # per integration interval (ISO 18405 levels, raw dB; add offset_db to display):
+        self.intervals: _Ring | None = None  # SPL, Lpk, SEL, floor, band
+        self.tol_series: _Ring | None = None  # third-octave levels, one column per band
+        self.psd_series: _Ring | None = None  # PSD (dB per Hz) over the statistics window
+        self.tol_bands: list[metrics.Band] = []
+        self.psd_freqs = np.zeros(0)
+        self.psd_nfft = 0
+        self.btr: _Ring | None = None  # bearing-time record (time x look direction)
+        self.btr_bearings = np.arange(0.0, 181.0, 2.0)
         self.freqs = np.zeros(0)
         self.nfft = 0
         self.hop = 0
@@ -217,6 +243,8 @@ class Analyzer:
         self._thread: threading.Thread | None = None
         self._pending: AnalysisSettings | None = None
         self._epoch = -1
+        self.external = False  # frames are fed in (spectrogram read off the screen)
+        self._frame_q: deque = deque()
         self._reset_all()
 
     # -- lifecycle -------------------------------------------------------------
@@ -238,11 +266,32 @@ class Analyzer:
     # -- results for the GUI ---------------------------------------------------
     @property
     def units(self) -> str:
-        return self.settings.calibration.units
+        return "dB (screen scale)" if self.external else self.settings.calibration.units
 
     @property
     def offset_db(self) -> float:
-        return self.settings.calibration.offset_db
+        return 0.0 if self.external else self.settings.calibration.offset_db
+
+    def feed_frames(self, times: np.ndarray, freqs: np.ndarray, frames: np.ndarray,
+                    reset: bool = False) -> None:
+        """Spectrogram frames from elsewhere (source thread); processed on the
+        analysis thread exactly like frames computed from audio.  ``reset``
+        means the level scale changed: the floor and history start afresh."""
+        self.external = True
+        self._frame_q.append((np.asarray(times, float), np.asarray(freqs, float),
+                              np.asarray(frames, float), reset))
+
+    def patch(self, t0: float, t1: float) -> dict | None:
+        """Spectrogram patch (frames x freqs dB) for [t0, t1] plus the floor."""
+        if self.spectro is None:
+            return None
+        t, d = self.spectro.range(t0, t1)
+        if len(t) < 1:
+            return None
+        floor = self._floor.floor if self._floor is not None and self._floor.floor is not None \
+            else np.percentile(d, 20, axis=0)
+        return {"freqs": self.freqs.copy(), "times": t, "db": d, "floor": np.array(floor),
+                "frame_period": self._frame_hop_s()}
 
     def floor_snapshot(self) -> tuple[np.ndarray, np.ndarray] | None:
         floor = self._floor.floor if self._floor is not None else None
@@ -270,6 +319,8 @@ class Analyzer:
         return self._grab_clip(det.t0 - pad, det.t1 + pad)
 
     def _grab_clip(self, t0: float, t1: float):
+        if self.external:
+            return self.patch(t0, t1)
         snap = self.buffer.range(t0, t1)
         if not len(snap) or not self.rate:
             return None
@@ -291,8 +342,12 @@ class Analyzer:
         self._recent_matches: list[Detection] = []
         self._raw_tail = np.zeros(0)
         self._report_t = 0.0
-        self._sec_acc: list = []
-        self._sec_start: float | None = None
+        self._demon_t = 0.0
+        self._demon = None
+        self._int_buf = np.zeros(0)
+        self._int_t0: float | None = None
+        self._btr_buf = np.zeros((0, 2))
+        self._btr_t0: float | None = None
         self._configured_for = None
 
     def channel_signal(self, y: np.ndarray) -> np.ndarray:
@@ -341,7 +396,31 @@ class Analyzer:
         self._event = None
         self._peaks = _PeakPicker()
         self._configure_filter()
+        self._configure_intervals()
+        self._configure_btr()
         self._configured_for = (rate, s.nfft, s.band)
+
+    def _configure_btr(self) -> None:
+        s = self.settings
+        self.btr = (_Ring(int(self.history_s / s.btr_step_s) + 8, len(self.btr_bearings))
+                    if s.array.enabled and self.nominal_rate else None)
+        self._btr_buf = np.zeros((0, 2))
+        self._btr_t0 = None
+
+    def _configure_intervals(self) -> None:
+        s, rate = self.settings, self.rate
+        n_int = max(8, int(round(s.integration_s * rate)))
+        self.psd_nfft = int(min(s.psd_nfft, n_int)) if s.psd_nfft else \
+            metrics.auto_psd_nfft(rate, n_int)
+        self.psd_freqs = np.fft.rfftfreq(self.psd_nfft, 1 / rate)
+        self.tol_bands = metrics.third_octave_bands(rate / 2)
+        rows = int(min(200_000, max(1000, 24 * 3600 / s.integration_s)))
+        self.intervals = _Ring(rows, 5, dtype=np.float64)
+        self.tol_series = _Ring(rows, len(self.tol_bands))
+        self.psd_series = _Ring(int(max(8, s.stats_window_s / s.integration_s)) + 1,
+                                len(self.psd_freqs))
+        self._int_buf = np.zeros(0)
+        self._int_t0 = None
 
     def _configure_filter(self) -> None:
         s = self.settings
@@ -369,12 +448,22 @@ class Analyzer:
             return
         if (new.nfft, new.band, new.channel) != (old.nfft, old.band, old.channel):
             self._configure()
-        elif (new.floor_rise_s, new.floor_fall_s) != (old.floor_rise_s, old.floor_fall_s):
+            return
+        if (new.floor_rise_s, new.floor_fall_s) != (old.floor_rise_s, old.floor_fall_s):
             self._floor.set_times(self.hop / self.rate, new.floor_rise_s, new.floor_fall_s)
+        if ((new.integration_s, new.psd_nfft, new.stats_window_s)
+                != (old.integration_s, old.psd_nfft, old.stats_window_s)):
+            self._configure_intervals()
+        if (new.array, new.btr_step_s) != (old.array, old.btr_step_s):
+            self._configure_btr()
+        if (new.demon, new.demon_band) != (old.demon, old.demon_band):
+            self._demon_t = 0.0
 
     def _process(self) -> bool:
         if self._pending is not None:
             self._apply_pending()
+        if self.external:
+            return self._external_step()
         buf = self.buffer
         if buf.epoch != self._epoch:  # history discarded (clear / seek)
             self._epoch = buf.epoch
@@ -406,6 +495,8 @@ class Analyzer:
         self.matcher.prepare(self.rate, self.nfft, self.hop)
         self._shape_step(sig, snap.x)
         self._spectral_step(sig, float(snap.x[0]))
+        self._integrate_step(sig, float(snap.x[0]))
+        self._bearing_step(snap)
         now = time.perf_counter()
         if now - self._report_t > 1.0:
             self._report_t = now
@@ -455,8 +546,6 @@ class Analyzer:
         fl = to_db(flin.sum(axis=1))
         band = to_db(p[:, bsel].sum(axis=1)) if bsel.any() else np.full(n, np.nan)
         self.levels.append(times, np.column_stack([bb, fl, band]))
-        self._per_second(times, p.sum(axis=1), flin.sum(axis=1),
-                         p[:, bsel].sum(axis=1) if bsel.any() else np.full(n, np.nan))
         snr = blur_freq(snr_frames(d, floors), axis=1).astype(np.float32)
         self._snr_hist = np.concatenate([self._snr_hist, snr])[-self._snr_cap:]
         self._snr_t = np.concatenate([self._snr_t, times])[-self._snr_cap:]
@@ -465,25 +554,166 @@ class Analyzer:
         if self.settings.detect:
             self._events(times, p, flin)
 
+    def _nyquist(self) -> float:
+        if self.external:
+            return float(self.freqs[-1]) if len(self.freqs) else 0.0
+        return self.rate / 2
+
     def _band_edges(self) -> tuple[float, float]:
         s = self.settings
         if s.band is not None and s.band.kind in ("bandpass", "lowpass", "highpass"):
-            return s.band.edges(self.rate)
-        return (self.freqs[1] if len(self.freqs) > 1 else 0.0), self.rate / 2
+            lo, hi = s.band.edges(2 * self._nyquist())
+            return lo, hi
+        return (self.freqs[1] if len(self.freqs) > 1 else 0.0), self._nyquist()
 
-    def _per_second(self, times, bb, fl, band) -> None:
-        for t, a, b, c in zip(times, bb, fl, band):
-            if self._sec_start is None:
-                self._sec_start = t
-            self._sec_acc.append((a, b, c))
-            if t - self._sec_start >= 1.0:
-                acc = np.array(self._sec_acc)
-                tol = self.report.third_octaves
-                row = [*to_db(np.nanmean(acc, axis=0)), tol.get("63 Hz", np.nan),
-                       tol.get("125 Hz", np.nan)]
-                self.long_levels.append(np.array([self._sec_start + 0.5]), np.array([row]))
-                self._sec_acc = []
-                self._sec_start = None
+    # -- spectrogram frames fed from outside (screen) ---------------------------------
+    def _configure_external(self, freqs: np.ndarray, times: np.ndarray) -> None:
+        s = self.settings
+        dt_s = float(np.median(np.diff(times))) if len(times) > 1 else 0.05
+        dt_s = max(dt_s, 1e-4)
+        self.rate, self.hop, self.nfft = 1.0 / dt_s, 1, 1
+        self.freqs = freqs.copy()
+        frames = int(self.history_s / dt_s) + 8
+        self.spectro = _Ring(frames, len(freqs))
+        self.levels = _Ring(frames, 3, dtype=np.float64)
+        self._floor = FloorTracker(len(freqs), dt_s, s.floor_rise_s, s.floor_fall_s)
+        self._snr_hist = np.zeros((0, len(freqs)), dtype=np.float32)
+        self._snr_cap = max(int(12.0 / dt_s), 64)
+        self._snr_t = np.zeros(0)
+        self._event = None
+        self._peaks = _PeakPicker()
+        self.intervals = self.tol_series = self.psd_series = None
+        self._configured_for = ("external", len(freqs), float(freqs[0]), float(freqs[-1]))
+
+    def _external_step(self) -> bool:
+        worked = False
+        while self._frame_q:
+            times, freqs, frames, reset = self._frame_q.popleft()
+            worked = True
+            if not len(times):
+                continue
+            key = ("external", len(freqs), float(freqs[0]), float(freqs[-1]))
+            if self._configured_for != key or reset:
+                self._configure_external(freqs, times)
+            self.matcher.prepare_grid(self.freqs, self._frame_hop_s())
+            # unreadable pixels (NaN) count as background
+            fill = self._floor.floor if self._floor.floor is not None else np.nanmedian(frames, 0)
+            fill = np.nan_to_num(fill, nan=float(np.nanmin(frames)) if np.isfinite(frames).any()
+                                 else 0.0)
+            d = np.where(np.isfinite(frames), frames, fill[None, :])
+            floors = self._floor.update(d)
+            self.spectro.append(times, d.astype(np.float32))
+            p, flin = 10 ** (d / 10), 10 ** (floors / 10)
+            lo, hi = self._band_edges()
+            bsel = (self.freqs >= lo) & (self.freqs <= hi)
+            self.levels.append(times, np.column_stack([
+                to_db(p.mean(axis=1)), to_db(flin.mean(axis=1)),
+                to_db(p[:, bsel].mean(axis=1)) if bsel.any() else np.full(len(times), np.nan)]))
+            snr = blur_freq(snr_frames(d, floors), axis=1).astype(np.float32)
+            self._snr_hist = np.concatenate([self._snr_hist, snr])[-self._snr_cap:]
+            self._snr_t = np.concatenate([self._snr_t, times])[-self._snr_cap:]
+            if self.settings.match and self.matcher.spectral:
+                self._scan_spectral(len(times))
+            if self.settings.detect:
+                self._events(times, p, flin)
+        now = time.perf_counter()
+        if worked and now - self._report_t > 1.0:
+            self._report_t = now
+            self._make_report()
+        return worked
+
+    # -- levels per integration interval (ISO 18405) -------------------------------
+    def _integrate_step(self, sig: np.ndarray, t_first: float) -> None:
+        if self.intervals is None:
+            return
+        if self._int_t0 is None:
+            self._int_t0, self._int_buf = t_first, sig
+        else:
+            self._int_buf = np.concatenate([self._int_buf, sig])
+        rate = self.rate
+        n = max(8, int(round(self.settings.integration_s * rate)))
+        lo, hi = self._band_edges() if self.settings.band is not None else (None, None)
+        while len(self._int_buf) >= n:
+            seg, self._int_buf = self._int_buf[:n], self._int_buf[n:]
+            t0 = self._int_t0
+            self._int_t0 += n / rate
+            m = metrics.broadband(seg, rate)
+            f, psd = metrics.welch(seg, rate, self.psd_nfft)
+            band = (float(to_db(metrics.band_mean_square(f, psd, lo, hi)))
+                    if lo is not None else float("nan"))
+            floor = float("nan")
+            if self.levels is not None:
+                _t, v = self.levels.range(t0, t0 + n / rate)
+                if len(v):
+                    floor = float(to_db(np.mean(10 ** (v[:, 1] / 10))))
+            self.intervals.append(np.array([t0]),
+                                  np.array([[m["SPL"], m["Lpk"], m["SEL"], floor, band]]))
+            self.tol_series.append(np.array([t0]),
+                                   metrics.band_levels(f, psd, self.tol_bands)[None, :])
+            self.psd_series.append(np.array([t0]), to_db(psd)[None, :].astype(np.float32))
+
+    # -- bearings (two-hydrophone array) ------------------------------------------
+    def _pair(self, y: np.ndarray) -> np.ndarray | None:
+        geo = self.settings.array
+        if not geo.enabled or y.ndim != 2 or max(geo.ch_a, geo.ch_b) >= y.shape[1]:
+            return None
+        return np.nan_to_num(y[:, [geo.ch_a, geo.ch_b]].astype(np.float64))
+
+    def _bearing_band(self) -> tuple[float, float] | None:
+        return self._band_edges() if self.settings.band is not None else None
+
+    def _bearing_step(self, snap) -> None:
+        if self.btr is None:
+            return
+        pair = self._pair(snap.y)
+        if pair is None:
+            return
+        if self._btr_t0 is None:
+            self._btr_t0, self._btr_buf = float(snap.x[0]), pair
+        else:
+            self._btr_buf = np.concatenate([self._btr_buf, pair])
+        n = max(64, int(self.settings.btr_step_s * self.rate))
+        geo, band = self.settings.array, self._bearing_band()
+        while len(self._btr_buf) >= n:
+            block, self._btr_buf = self._btr_buf[:n], self._btr_buf[n:]
+            scan = bearing_scan(block[:, 0], block[:, 1], self.rate, geo, self.btr_bearings, band)
+            self.btr.append(np.array([self._btr_t0 + n / (2 * self.rate)]), scan[None, :])
+            self._btr_t0 += n / self.rate
+
+    def _detection_bearing(self, det: "Detection") -> None:
+        if self.external or not self.settings.array.enabled:
+            return
+        snap = self.buffer.range(det.t0, det.t1)
+        pair = self._pair(snap.y) if len(snap) else None
+        if pair is None or len(pair) < 64:
+            return
+        band = (det.f_lo, det.f_hi) if det.f_hi > det.f_lo else None
+        tau, q = tdoa(pair[:, 0], pair[:, 1], self.rate, self.settings.array.max_delay, band)
+        det.bearing = bearing_from_delay(tau, self.settings.array)
+        det.bearing_q = q
+
+    def latest_psd(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """(freqs, PSD dB per Hz, uncalibrated) of the last interval."""
+        ring = self.psd_series
+        if ring is None or not ring.count:
+            return None
+        _t, v = ring.latest(1)
+        return self.psd_freqs, v[0]
+
+    def psd_percentiles(self, q=(5, 50, 95)) -> dict[int, np.ndarray]:
+        ring = self.psd_series
+        if ring is None or ring.count < 3:
+            return {}
+        _t, v = ring.latest(ring.count)
+        return metrics.percentiles_db(v, axis=0, q=q)
+
+    def tol_window(self) -> tuple[np.ndarray, np.ndarray]:
+        """Third-octave levels over the statistics window: (times, levels)."""
+        ring = self.tol_series
+        if ring is None or not ring.count:
+            return np.zeros(0), np.zeros((0, len(self.tol_bands)))
+        n = int(max(1, self.settings.stats_window_s / self.settings.integration_s))
+        return ring.latest(n)
 
     def _frame_hop_s(self) -> float:
         return self.hop / self.rate
@@ -561,7 +791,7 @@ class Analyzer:
             r0 = min(t.r0 for t in tpls)
             r1 = max(t.r1 for t in tpls) - 1
             return float(self.freqs[r0]), float(self.freqs[min(r1, len(self.freqs) - 1)])
-        return 0.0, (self.rate or 0) / 2
+        return 0.0, self._nyquist() if self.rate else 0.0
 
     def _region_snr(self, t0: float, t1: float) -> float:
         if self.levels is None:
@@ -574,7 +804,7 @@ class Analyzer:
 
     def _events(self, times: np.ndarray, p: np.ndarray, flin: np.ndarray) -> None:
         s = self.settings
-        lo, hi = self._band_edges() if s.detect_in_band else (0.0, self.rate / 2)
+        lo, hi = self._band_edges() if s.detect_in_band else (0.0, self._nyquist())
         sel = (self.freqs >= lo) & (self.freqs <= hi)
         if not sel.any():
             return
@@ -591,19 +821,23 @@ class Analyzer:
                 if band_snr[i] >= on:
                     self._event = ev = {"t0": t - hop_s / 2, "t1": t + hop_s / 2,
                                         "snr": band_snr[i], "quiet": 0,
-                                        "bins": bin_snr[i] > 6}
+                                        "peak": bin_snr[i].copy()}
                 continue
             if band_snr[i] >= off:
                 ev["t1"] = t + hop_s / 2
                 ev["snr"] = max(ev["snr"], band_snr[i])
-                ev["bins"] |= bin_snr[i] > 6
+                np.maximum(ev["peak"], bin_snr[i], out=ev["peak"])
                 ev["quiet"] = 0
             else:
                 ev["quiet"] += 1
             if ev["quiet"] * hop_s >= 0.08 or ev["t1"] - ev["t0"] >= s.max_event_s:
                 self._event = None
                 if ev["t1"] - ev["t0"] >= s.min_event_s:
-                    active = np.flatnonzero(ev["bins"])
+                    # frequency extent: bins whose peak rose well above the floor
+                    # during the event (follows sweeps; noise almost never reaches
+                    # +12 dB in a single frame)
+                    pk = ev["peak"]
+                    active = np.flatnonzero(pk >= max(on + 2.0, float(pk.max()) - 25.0))
                     f_lo = float(fsel[active[0]]) if len(active) else lo
                     f_hi = float(fsel[active[-1]]) if len(active) else hi
                     self._close_event(ev["t0"], ev["t1"], f_lo, f_hi, float(ev["snr"]))
@@ -660,6 +894,7 @@ class Analyzer:
 
     # -- detections store ----------------------------------------------------------
     def _add_detection(self, det: Detection) -> None:
+        self._detection_bearing(det)
         clip = self._grab_clip(det.t0 - 0.25, det.t1 + 0.25)
         with self._det_lock:
             det.id = self._next_id
@@ -670,14 +905,14 @@ class Analyzer:
                 self._drop_clip(old.id)
         if clip is not None:
             self.clips[det.id] = clip
-            self._clip_bytes += clip[0].nbytes
+            self._clip_bytes += _nbytes(clip)
             while self._clip_bytes > self.CLIP_BUDGET_BYTES and self.clips:
                 self._drop_clip(next(iter(self.clips)))
 
     def _drop_clip(self, det_id: int) -> None:
         clip = self.clips.pop(det_id, None)
         if clip is not None:
-            self._clip_bytes -= clip[0].nbytes
+            self._clip_bytes -= _nbytes(clip)
 
     def update_detection(self, det: Detection, **changes) -> None:
         with self._det_lock:
@@ -685,37 +920,59 @@ class Analyzer:
                 setattr(det, k, v)
 
     # -- noise report ----------------------------------------------------------------
+    DEMON_WINDOW_S = 10.0
+
+    def _demon_step(self, rep) -> None:
+        """Propeller modulation over the last ~10 s, refreshed every few
+        seconds (less often when it is slow, e.g. at high sample rates)."""
+        if not self.settings.demon or self.external or not self.rate:
+            self._demon = None
+            return
+        now = time.perf_counter()
+        if now >= self._demon_t:
+            snap = self.buffer.latest(int(self.rate * self.DEMON_WINDOW_S))
+            if len(snap) >= self.rate * 2:
+                started = time.perf_counter()
+                try:
+                    self._demon = demon(self.channel_signal(snap.y), self.rate,
+                                        self.settings.demon_band)
+                except Exception:
+                    log.exception("DEMON analysis failed")
+                    self._demon = None
+                self._demon_t = now + max(5.0, 20 * (time.perf_counter() - started))
+        rep.demon = self._demon
+        d = self._demon
+        if d is not None and d.blades:
+            rep.sources.insert(0, ("Vessel propeller (DEMON)", 0.9, d.describe()))
+
     def _make_report(self) -> None:
         s = self.settings
-        off = s.calibration.offset_db
-        rep = noise.NoiseReport(units=s.calibration.units)
-        if self.levels is not None and self.levels.count:
-            t_last = self.levels.last_t()
-            t, v = self.levels.range(t_last - s.stats_window_s, t_last)
-            if len(t):
-                rep.level_db = float(v[-1, 0] + off)
-                rep.floor_db = float(v[-1, 1] + off)
-                rep.band_db = float(v[-1, 2] + off) if s.band is not None else float("nan")
-                rep.stats = {k: val + off for k, val in noise.exceedance_levels(v[:, 0]).items()}
+        off = self.offset_db
+        rep = noise.NoiseReport(units=self.units)
+        ring = self.intervals
+        if ring is not None and ring.count:
+            n = int(max(1, s.stats_window_s / s.integration_s))
+            _t, v = ring.latest(n)
+            rep.level_db = float(v[-1, 0] + off)
+            rep.peak_db = float(v[-1, 1] + off)
+            rep.floor_db = float(v[-1, 3] + off)
+            rep.band_db = float(v[-1, 4] + off) if s.band is not None else float("nan")
+            rep.stats = {k: val + off for k, val in noise.exceedance_levels(v[:, 0]).items()}
+            _tt, tol = self.tol_series.latest(1)
+            if len(tol):
+                rep.third_octaves = {b.label: float(tol[0, i] + off)
+                                     for i, b in enumerate(self.tol_bands)}
         raw = self._raw_tail
         if len(raw) >= 64:
             rep.crest_db, rep.kurtosis = noise.impulsiveness(raw)
-            rate = self.rate
-            nfft = int(min(len(raw), 1 << int(np.log2(max(rate, 64)))))
-            pw = power_frames(raw, nfft, max(1, nfft // 2))
-            if len(pw):
-                psum = pw.mean(axis=0)
-                freqs = np.fft.rfftfreq(nfft, 1 / rate)
-                for fc, lo, hi in noise.third_octave_bands(rate / 2):
-                    rep.third_octaves[noise.nominal(fc)] = float(
-                        noise.db(noise.band_power(psum, freqs, lo, hi)) + off)
         if self.spectro is not None and self.spectro.count >= 4:
             t, d = self.spectro.latest(int(10.0 / self._frame_hop_s()))
             ltsa = to_db(np.mean(10 ** (d / 10), axis=0))
             rep.flatness = noise.spectral_flatness(10 ** (ltsa[1:] / 10))
             rep.tonals = noise.tonal_lines(ltsa, self.freqs)
             rep.sources = noise.guess_sources(self.freqs, ltsa, rep.tonals, rep.kurtosis,
-                                              self.rate)
+                                              2 * self._nyquist())
+        self._demon_step(rep)
         self.report = rep
         self.alarm = bool(s.floor_alarm and np.isfinite(rep.floor_db)
                           and rep.floor_db >= s.floor_alarm_db)
