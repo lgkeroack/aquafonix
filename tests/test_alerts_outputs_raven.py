@@ -119,10 +119,13 @@ def test_outputs_reach_every_sink(tmp_path):
         while len(got_http) < 2 and time.time() < deadline:
             time.sleep(0.05)
         assert [m["type"] for m in got_http] == ["detection", "alert"]
+        def file_lines():
+            return (tmp_path / "out.jsonl").read_text(encoding="utf-8").splitlines()
+
         deadline = time.time() + 3
-        while time.time() < deadline and len((tmp_path / "out.jsonl").read_text().splitlines()) < 2:
+        while time.time() < deadline and len(file_lines()) < 2:
             time.sleep(0.05)
-        assert len((tmp_path / "out.jsonl").read_text().splitlines()) == 2  # levels were off
+        assert len(file_lines()) == 2  # levels were off
         client.close()
     finally:
         hub.close()
@@ -158,7 +161,7 @@ def test_raven_round_trip_teaches_signatures(recording, tmp_path):
     rows = raven.detection_rows(dets, 1, wall_time=lambda t: 1.7e9 + t,
                                 locate=lambda t: ("rec.wav", t))
     raven.write_table(tmp_path / "sel.txt", rows, raven.DETECTION_EXTRA)
-    header = (tmp_path / "sel.txt").read_text().splitlines()[0].split("\t")
+    header = (tmp_path / "sel.txt").read_text(encoding="utf-8").splitlines()[0].split("\t")
     assert header[:8] == list(raven.STANDARD) + ["Annotation"]
     table = raven.read_table(tmp_path / "sel.txt")
     assert len(table.selections) == 3 and table.label_columns()[0] == "Annotation"
@@ -175,7 +178,7 @@ def test_raven_pro_table_with_view_rows(recording, tmp_path):
         "High Freq (Hz)\tSpecies\n"
         "1\tWaveform 1\t1\t14.0\t14.4\t0\t8000\tUpsweep\n"
         "1\tSpectrogram 1\t1\t14.0\t14.4\t1300\t3400\tUpsweep\n"
-        "2\tSpectrogram 1\t1\t5.0\t5.3\t100\t500\t\n")
+        "2\tSpectrogram 1\t1\t5.0\t5.3\t100\t500\t\n", encoding="utf-8")
     table = raven.read_table(tmp_path / "pro.txt")
     assert len(table.selections) == 2 and table.selections[0].low == 1300
     assert table.label_columns()[0] == "Species"
@@ -185,6 +188,6 @@ def test_raven_pro_table_with_view_rows(recording, tmp_path):
 
 
 def test_not_a_raven_table(tmp_path):
-    (tmp_path / "x.txt").write_text("a\tb\n1\t2\n")
+    (tmp_path / "x.txt").write_text("a\tb\n1\t2\n", encoding="utf-8")
     with pytest.raises(ValueError):
         raven.read_table(tmp_path / "x.txt")

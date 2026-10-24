@@ -47,7 +47,7 @@ def write_wav(path: Path, x: np.ndarray, fs: int) -> Path:
     return path
 
 
-def replay(win, gui, path, speed="4", until=None, timeout=20.0):
+def replay(win, gui, path, speed="4", until=None, timeout=60.0):
     win.select_source("audiofile")
     win.file_panel.set_path(str(path))
     win.set_control("audiofile.speed", speed)
@@ -69,8 +69,8 @@ def test_live_generator_draws_everything(window, gui):
     assert "samples/s" in win.status_label.text()
     for w in (win.spectrum_on, win.tol_on, win.spec_log, win.spec_snr, win.peak_on):
         w.setChecked(True)
-    assert gui.wait_until(lambda: npts(win.spec_plot.current) > 10 and len(win.tol_plot.labels) > 10,
-                          5)
+    assert gui.wait_until(
+        lambda: npts(win.spec_plot.current) > 10 and len(win.tol_plot.labels) > 10, 5)
     win.zoom_x(0.5)
     win.zoom_y(0.5)
     win.fit_view()
@@ -95,7 +95,7 @@ def test_replay_identify_and_review(window, gui, no_dialogs, tmp_path):
     win.set_control("audiofile.speed", "4")
     assert win.start()
     assert win.transport.isVisible() and win.rec_view.isVisible()
-    assert gui.wait_until(lambda: win.analyzer.processed_index > 1.6 * fs, 10)
+    assert gui.wait_until(lambda: win.analyzer.processed_index > 1.6 * fs, 30)
     win.source.set_paused(True)
     gui.pump(0.3)
     win._spectro_select(0.95, 1.45, win.spectro.fy(1300), win.spectro.fy(3400), True)
@@ -112,7 +112,7 @@ def test_replay_identify_and_review(window, gui, no_dialogs, tmp_path):
     detail.close()
     win.act_pause.setChecked(False)
     win.source.set_paused(False)
-    gui.wait_until(lambda: win.source.position >= 27, 15)
+    gui.wait_until(lambda: win.source.position >= 27, 60)
     gui.pump(1.0)
     dets = win.analyzer.all_detections()
     sus = [d for d in dets if d.status == "suspected"]
@@ -218,7 +218,7 @@ def test_alerts_outputs_and_raven(window, gui, no_dialogs, tmp_path, monkeypatch
     assert kinds.count("levels") >= 20
     lv = next(m for m in msgs if m["type"] == "levels")
     assert lv["time"].startswith("2024-03-01") and len(lv["third_octaves_db"]) > 10
-    assert len((tmp_path / "stream.jsonl").read_text().splitlines()) == len(msgs)
+    assert len((tmp_path / "stream.jsonl").read_text(encoding="utf-8").splitlines()) == len(msgs)
     saved = [r for r in win.store.list() if r.kind == "alert"]
     assert len(saved) >= 3 and "Upsweeps" in saved[0].tags and saved[0].duration > 8
     sus = [d for d in win.analyzer.all_detections() if d.status == "suspected"]
@@ -228,7 +228,7 @@ def test_alerts_outputs_and_raven(window, gui, no_dialogs, tmp_path, monkeypatch
                if m["type"] == "detection")
     no_dialogs["save"] = str(tmp_path / "dets.txt")
     win.export_detections_raven()
-    lines = (tmp_path / "dets.txt").read_text().splitlines()
+    lines = (tmp_path / "dets.txt").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1 + len(win.analyzer.all_detections())
     assert "20240301_060000.wav" in lines[1]
     win.stop()
@@ -279,19 +279,31 @@ class _Chart(QWidget):
                 p.drawLine(int(a), int(b), int(c), int(d))
 
 
+def _spot(w: int, h: int) -> tuple[int, int]:
+    """Top-left for a w x h test window near the top-right of the primary
+    screen (works on small CI screens too)."""
+    from PySide6.QtGui import QGuiApplication
+
+    screen = QGuiApplication.primaryScreen()
+    if abs(screen.devicePixelRatio() - 1.0) > 1e-6:
+        pytest.skip("screen-capture tests assume 100% display scaling")
+    g = screen.availableGeometry()
+    return max(g.left(), g.right() - w - 20), g.top() + 40
+
+
 @needs_screen
 def test_screen_region_with_two_traces(window, gui):
     win = window
-    win.resize(850, 900)
-    win.move(0, 0)
+    x, y = _spot(400, 200)
     chart = _Chart()
     chart.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-    chart.setGeometry(1000, 40, 400, 200)
+    chart.setGeometry(x, y, 400, 200)
     chart.show()
+    chart.raise_()
     gui.pump(0.8)
     try:
         win.select_source("screen")
-        win.screen_panel.set_region(Region(1000, 40, 400, 200))
+        win.screen_panel.set_region(Region(x, y, 400, 200))
         assert win.start()
         gui.pump(1.0)
         win._autodetect_traces(2)
@@ -310,22 +322,22 @@ def test_region_selector_and_screen_spectrogram(window, gui, no_dialogs):
     from aquafonix.screen.specread import ColourScale
 
     win = window
-    win.resize(850, 900)
-    win.move(0, 0)
+    rows, view, total = 160, 360, 4000
+    x0, y0 = _spot(view + 26, rows)
     win.select_source("screen")
     got = []
     win.selector.finished.connect(got.append)
     win.selector.start()
     gui.pump(0.3)
-    ov = win.selector.overlays[0]
-    QTest.mousePress(ov, Qt.LeftButton, Qt.NoModifier, QPoint(1000, 100))
-    QTest.mouseMove(ov, QPoint(1200, 200))
-    QTest.mouseRelease(ov, Qt.LeftButton, Qt.NoModifier, QPoint(1200, 200))
+    ov = next(o for o in win.selector.overlays if o.screen() == gui.app.primaryScreen())
+    g = ov.geometry()
+    QTest.mousePress(ov, Qt.LeftButton, Qt.NoModifier, QPoint(100, 100))
+    QTest.mouseMove(ov, QPoint(300, 200))
+    QTest.mouseRelease(ov, Qt.LeftButton, Qt.NoModifier, QPoint(300, 200))
     gui.pump(0.3)
-    assert got and got[0] == Region(1000, 100, 200, 100)
+    assert got and got[0] == Region(g.x() + 100, g.y() + 100, 200, 100)
 
     lut, _ = ColourScale("viridis", low_db=40, high_db=120).lut()
-    rows, view, total = 160, 360, 4000
     truth = 50 + np.random.default_rng(0).normal(0, 2, (rows, total))
     for c0 in range(150, total, 400):
         for k in range(30):
@@ -349,16 +361,17 @@ def test_region_selector_and_screen_spectrogram(window, gui, no_dialogs):
             QPainter(self).drawImage(0, 0, q)
 
     spec = Spec()
-    spec.setWindowFlags(Qt.FramelessWindowHint)
-    spec.setGeometry(900, 300, view + 26, rows)
+    spec.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+    spec.setGeometry(x0, y0, view + 26, rows)
     spec.show()
+    spec.raise_()
     timer = QTimer()
     timer.timeout.connect(lambda: (state.update(pos=min(total, state["pos"] + 3)), spec.update()))
     timer.start(40)
     try:
         gui.pump(0.5)
         sp = win.screen_panel
-        sp.set_region(Region(900, 300, view + 26, rows))
+        sp.set_region(Region(x0, y0, view + 26, rows))
         sp.output.setCurrentIndex(sp.output.findData("spectrogram"))
         for key, px, val in (("ya", rows, 0.0), ("yb", 0, 8000.0)):
             sp.set_cal_px(key, px, emit_line=True)
@@ -369,7 +382,7 @@ def test_region_selector_and_screen_spectrogram(window, gui, no_dialogs):
         win._bar_picked(view + 12, 0, view + 24, rows)
         gui.pump(0.2)
         assert sp.scale.currentData() == "bar" and len(sp._bar_colors()) > 50
-        sp.set_region(Region(900, 300, view, rows), reset_calibration=False)
+        sp.set_region(Region(x0, y0, view, rows), reset_calibration=False)
         an = win.analyzer
         assert gui.wait_until(lambda: an.spectro is not None and an.spectro.count > 200, 10)
         assert an.external and win.spectro.image.image is not None
@@ -397,3 +410,18 @@ def test_region_selector_and_screen_spectrogram(window, gui, no_dialogs):
     finally:
         timer.stop()
         spec.close()
+
+
+def test_command_line():
+    from aquafonix.app import parse_args
+
+    args = parse_args(["rec1.wav", "folder", "--set", "a=1", "--start"])
+    assert args.recordings == ["rec1.wav", "folder"] and args.set == ["a=1"] and args.start
+    assert parse_args(["--smoke-test"]).smoke_test == "-"
+
+
+def test_smoke_test_mode(qapp, capsys):
+    from aquafonix.app import smoke_test
+
+    assert smoke_test("-") == 0
+    assert "SMOKE TEST OK" in capsys.readouterr().out

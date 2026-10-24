@@ -36,7 +36,7 @@ def rec(tmp_path_factory):
                 f.comment = "SN1234 hydrophone sensitivity -168.0 dB re 1V/uPa, gain 6 dB"
             f.write(y)
     (d / "20231015_120000.txt").write_text(
-        "Hydrophone sensitivity: -170.5 dB re 1 V/uPa\nPreamp gain: 20 dB\n")
+        "Hydrophone sensitivity: -170.5 dB re 1 V/uPa\nPreamp gain: 20 dB\n", encoding="utf-8")
     return d
 
 

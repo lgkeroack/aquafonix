@@ -58,7 +58,7 @@ F5  start / stop          F6  pause (explore history) / live
 F9  capture the last N seconds as an event
 + / -  zoom time in / out     Ctrl+Up / Ctrl+Down  zoom Y     0  fit
 S  selection tool (or Shift-drag on the waveform / spectrogram)
-Z  zoom to selection     I  identify selection     P  play selection
+Z  zoom to selection     I  identify selection     P  play selection     A  analyse
 L  listen live     Esc  stop playback / clear selection
 C / X  confirm / reject the selected detection
 Mouse wheel zooms, drag pans; right-click a plot for more options."""

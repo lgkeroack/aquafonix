@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aquafonix"
+dynamic = ["version"]
+description = "Real-time monitor and analysis tool for hydrophones, audio, data streams and graphs on screen"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26",
+    "PySide6-Essentials>=6.6",
+    "pyqtgraph>=0.13.7",
+    "mss>=9.0",
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12",
+    "pyserial>=3.5",
+    "PyAudioWPatch>=0.2.12; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+build = ["pyinstaller>=6.6"]
+
+[project.gui-scripts]
+aquafonix = "aquafonix.app:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "aquafonix.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aquafonix = ["assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
