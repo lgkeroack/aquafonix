@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
@@ -213,6 +214,7 @@ class ScreenSource(Source):
         if len(times):
             self.push_frames(times, grid, new, reset=self._spec_reset)
             self._spec_reset = False
-            with np.errstate(all="ignore"):
+            with np.errstate(all="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)  # all-blank columns
                 lvl = 10 * np.log10(np.nanmean(10 ** (new / 10), axis=1))
             self.push(times, lvl, ["level (dB)"])

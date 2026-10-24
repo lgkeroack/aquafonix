@@ -122,47 +122,58 @@ def _running_median(x: np.ndarray, k: int) -> np.ndarray:
 
 def _tolerance(f: float, df: float) -> float:
     """How far a line may sit from an exact harmonic: interpolated line
-    frequencies are good to a fraction of a bin; allow ~1% for rate drift."""
-    return max(0.6 * df, 0.01 * f)
+    frequencies are good to a fraction of a bin; allow a little for rate drift."""
+    return max(0.6 * df, 0.005 * f)
+
+
+MAX_HARMONIC = 40
+MISSING_PENALTY_DB = 6.0  # a missing lower harmonic costs about one threshold-level line
+
+
+def _family(f0: float, lines, df: float) -> list[tuple[int, float, float]]:
+    out = []
+    for f, prom in lines:
+        k = round(f / f0)
+        if 1 <= k <= MAX_HARMONIC and abs(f - k * f0) <= _tolerance(f, df):
+            out.append((k, f, prom))
+    return out
 
 
 def _harmonics(res: DemonResult) -> None:
-    """Fundamental that explains most lines (harmonic sieve)."""
+    """Shaft rate = the fundamental whose harmonic family best explains the
+    lines (harmonic sieve).  Every harmonic it predicts below its strongest
+    member but that is missing costs a penalty, so a sub-harmonic (f0/2,
+    f0/7, ...) can't win just because it also "explains" the same lines.
+    At least two related lines are required."""
     lines = res.lines
-    if not lines:
+    if len(lines) < 2:
         return
-    df = res.freqs[1] - res.freqs[0] if len(res.freqs) > 1 else 0.1
-    best, best_score = None, 0.0
-    for f0 in sorted({f for f, _ in lines} | {f / k for f, _ in lines for k in (2, 3, 4, 5, 6, 7)}):
-        if f0 < 2 * df:
+    df = max(res.freqs[1] - res.freqs[0] if len(res.freqs) > 1 else 0.1, 1e-9)
+    best, best_score, best_family = None, -np.inf, []
+    candidates = {f for f, _ in lines} | {f / k for f, _ in lines for k in range(2, 10)}
+    for f0 in sorted(candidates):
+        if f0 < max(2 * df, 0.3):
             continue
-        score, hits = 0.0, 0
-        for f, prom in lines:
-            k = round(f / f0)
-            if k >= 1 and abs(f - k * f0) <= _tolerance(f, df):
-                score += prom
-                hits += 1
-        score *= min(hits, 4) / 4  # prefer families over single lines
-        if score > best_score * 1.05 or (best is not None and score >= best_score * 0.95
-                                          and f0 > best and hits >= 2):
-            best, best_score = f0, score
-    if best is None:
+        fam = _family(f0, lines, df)
+        if len(fam) < 2:
+            continue
+        ks = {k for k, _, _ in fam}
+        k_top = max(fam, key=lambda m: m[2])[0]
+        missing = sum(1 for k in range(1, k_top) if k not in ks)
+        score = sum(p for _, _, p in fam) - MISSING_PENALTY_DB * missing
+        if score > best_score + 1e-6 or (score > best_score - 1e-6 and best is not None
+                                         and f0 > best):
+            best, best_score, best_family = f0, score, fam
+    if best is None or best_score <= 0:
         return
-    res.shaft_hz = float(best)
-    # Blade rate: the strongest (by level) harmonic of the shaft rate above
-    # the fundamental, if it is at least about as strong as the fundamental.
-    df = max(df, 1e-9)
-    family = []
-    for f, _ in lines:
-        k = round(f / best)
-        if k >= 1 and abs(f - k * best) <= _tolerance(f, df):
-            family.append((k, f, float(np.interp(f, res.freqs, res.level_db))))
-    if family:  # least-squares shaft rate from the whole family
-        ks = np.array([k for k, _, _ in family], float)
-        fs = np.array([f for _, f, _ in family])
-        res.shaft_hz = float(np.sum(ks * fs) / np.sum(ks * ks))
-    fundamental = max((lv for k, _, lv in family if k == 1), default=-np.inf)
-    upper = [(lv, k, f) for k, f, lv in family if 2 <= k <= 9]
+    ks = np.array([k for k, _, _ in best_family], float)
+    fs = np.array([f for _, f, _ in best_family])
+    res.shaft_hz = float(np.sum(ks * fs) / np.sum(ks * ks))  # least squares over the family
+    # Blade rate: the strongest (by level) harmonic above the fundamental, if
+    # it is at least about as strong as the fundamental.
+    levels = [(k, f, float(np.interp(f, res.freqs, res.level_db))) for k, f, _ in best_family]
+    fundamental = max((lv for k, _, lv in levels if k == 1), default=-np.inf)
+    upper = [(lv, k, f) for k, f, lv in levels if 2 <= k <= 9]
     if upper:
         lv, k, f = max(upper)
         if lv >= fundamental - 3.0:
