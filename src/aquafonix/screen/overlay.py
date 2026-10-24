@@ -131,6 +131,12 @@ class _Overlay(QWidget):
         p.setPen(QColor(240, 240, 240))
         p.drawText(rect, Qt.AlignCenter, text)
 
+    @staticmethod
+    def _span(a: QPoint, b: QPoint) -> QRect:
+        """Rectangle between two drag points; a drag of 200 px is 200 px wide."""
+        return QRect(min(a.x(), b.x()), min(a.y(), b.y()), abs(b.x() - a.x()),
+                     abs(b.y() - a.y()))
+
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.RightButton:
             self._selector.finish(None)
@@ -142,13 +148,13 @@ class _Overlay(QWidget):
     def mouseMoveEvent(self, event) -> None:
         self._hover = event.position().toPoint()
         if self._origin is not None:
-            self._sel = QRect(self._origin, self._hover).normalized()
+            self._sel = self._span(self._origin, self._hover)
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() != Qt.LeftButton or self._origin is None:
             return
-        self._sel = QRect(self._origin, event.position().toPoint()).normalized()
+        self._sel = self._span(self._origin, event.position().toPoint())
         self._origin = None
         if self._sel.width() >= 3 and self._sel.height() >= 3:
             self._selector.finish(self.region())
@@ -201,32 +207,67 @@ class RegionSelector(QObject):
         self.finished.emit(region)
 
 
-class RegionOutline(QWidget):
-    """Click-through dashed frame drawn just outside the watched region."""
+class _Strip(QWidget):
+    """One side of the outline: a small opaque, click-through window."""
+
+    def __init__(self, color: QColor) -> None:
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+                         | Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.color = color
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(20, 20, 20))
+        pen = QPen(self.color, max(1, min(self.width(), self.height()) - 1), Qt.DashLine)
+        p.setPen(pen)
+        if self.width() >= self.height():
+            p.drawLine(0, self.height() // 2, self.width(), self.height() // 2)
+        else:
+            p.drawLine(self.width() // 2, 0, self.width() // 2, self.height())
+
+
+class RegionOutline:
+    """Dashed frame just *outside* the watched region, made of four thin
+    opaque strips, so nothing is ever drawn over the captured pixels (a
+    single translucent window would turn black there without a compositor)."""
 
     BORDER = 3
 
     def __init__(self) -> None:
-        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
-                         | Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.color = QColor(255, 150, 0)
+        self._strips = [_Strip(self.color) for _ in range(4)]
+        self._visible = False
 
     def set_region(self, region: Region) -> None:
         try:
             monitors = monitor_rects()
         except Exception:
             monitors = []
+        r = region_to_logical(region, monitors)
         b = self.BORDER
-        self.setGeometry(region_to_logical(region, monitors).adjusted(-b, -b, b, b))
-        self.update()
+        x, y, w, h = r.x(), r.y(), r.width(), r.height()
+        rects = [QRect(x - b, y - b, w + 2 * b, b), QRect(x - b, y + h, w + 2 * b, b),
+                 QRect(x - b, y, b, h), QRect(x + w, y, b, h)]
+        for strip, rect in zip(self._strips, rects):
+            strip.setGeometry(rect)
+            strip.update()
 
-    def paintEvent(self, _event) -> None:
-        p = QPainter(self)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        p.setPen(QPen(QColor(0, 0, 0, 200), 2))
-        p.drawRect(r)
-        p.setPen(QPen(self.color, 2, Qt.DashLine))
-        p.drawRect(r)
+    def show(self) -> None:
+        self._visible = True
+        for strip in self._strips:
+            strip.show()
+
+    def hide(self) -> None:
+        self._visible = False
+        for strip in self._strips:
+            strip.hide()
+
+    def isVisible(self) -> bool:  # noqa: N802 - mirrors QWidget
+        return self._visible
+
+    def close(self) -> None:
+        for strip in self._strips:
+            strip.close()
+        self._visible = False

@@ -16,6 +16,8 @@ log = logging.getLogger("aquafonix")
 
 EPILOG = """\
 examples:
+  Aquafonix.exe D:\\deployment1\\               (replay a folder of recordings)
+  Aquafonix.exe 20240301_060000.wav --start
   Aquafonix.exe --source serial --set serial.port=COM3 --set serial.baud=115200 --start
   Aquafonix.exe --source network --set network.protocol=udp --set network.port=9000 --start
   Aquafonix.exe --source screen --region 100,200,640,320 --start
@@ -30,8 +32,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog=APP_NAME, description=(
         "Real-time monitor for audio, serial/network/file data streams and graphs on screen."),
         epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--source", choices=["audio", "serial", "network", "file", "screen",
-                                        "generator"], help="source to select at startup")
+    p.add_argument("recordings", nargs="*", metavar="RECORDING",
+                   help="audio files or folders to replay (as one continuous recording)")
+    p.add_argument("--source", choices=["audio", "audiofile", "serial", "network", "file",
+                                        "screen", "generator"],
+                   help="source to select at startup")
     p.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
                    help="set a control, e.g. serial.port=COM3 (repeatable)")
     p.add_argument("--region", metavar="X,Y,W,H",
@@ -39,6 +44,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--start", action="store_true", help="start streaming immediately")
     p.add_argument("--settings", metavar="PATH", help="settings file to use")
     p.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
+    p.add_argument("--smoke-test", nargs="?", const="-", metavar="REPORT",
+                   help="check that everything loads and the analysis runs, then exit "
+                        "(0 = OK); the report goes to REPORT or stdout")
     return p.parse_args(argv)
 
 
@@ -119,8 +127,95 @@ def apply_theme(app) -> None:
     pg.setConfigOptions(background=(18, 20, 24), foreground=(200, 205, 212), antialias=False)
 
 
+def smoke_test(report: str) -> int:
+    """Self-check for builds: libraries load, audio files round-trip, the
+    main window runs the analysis on the test signal."""
+    import importlib
+    import tempfile
+    import time
+
+    lines, failed = [f"{APP_NAME} {__version__} smoke test ({sys.platform})"], False
+
+    def result(name: str, ok: bool, detail: str = "", required: bool = True) -> None:
+        nonlocal failed
+        failed |= required and not ok
+        tag = "PASS" if ok else ("FAIL" if required else "SKIP")
+        lines.append(f"{tag}  {name}" + (f": {detail}" if detail else ""))
+
+    windows = sys.platform == "win32"
+    for mod, required in (("numpy", True), ("PySide6.QtWidgets", True), ("pyqtgraph", True),
+                          ("mss", True), ("soundfile", True), ("sounddevice", windows),
+                          ("serial", True), ("pyaudiowpatch", windows)):
+        try:
+            m = importlib.import_module(mod)
+            result(f"import {mod}", True, str(getattr(m, "__version__", "")), required)
+        except Exception as exc:
+            result(f"import {mod}", False, str(exc) or type(exc).__name__, required)
+    tmp = Path(tempfile.mkdtemp(prefix="aquafonix-smoke-"))
+    try:
+        import numpy as np
+
+        from aquafonix import audiofile
+
+        x = np.sin(2 * np.pi * 440 * np.arange(4800) / 48000)
+        audiofile.write(str(tmp / "t.wav"), x, 48000)
+        y, rate = audiofile.read(str(tmp / "t.wav"))
+        result("audio file round trip", rate == 48000 and np.allclose(y[:, 0], x, atol=1e-6))
+    except Exception as exc:
+        result("audio file round trip", False, str(exc))
+    try:
+        from aquafonix.screen.capture import MssGrabber, Region
+
+        g = MssGrabber()
+        shot = g.grab(Region(0, 0, 8, 8))
+        g.close()
+        result("screen capture", shot.shape == (8, 8, 3), required=windows)
+    except Exception as exc:
+        result("screen capture", False, str(exc), required=windows)
+    try:
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication(sys.argv[:1])
+        apply_theme(app)
+        from aquafonix.ui.main_window import MainWindow
+
+        win = MainWindow(QSettings(str(tmp / "smoke.ini"), QSettings.IniFormat), tmp / "data")
+        win.persist = False
+        win.show()
+        win.select_source("generator")
+        ok = win.start()
+        end = time.perf_counter() + 20
+        while ok and time.perf_counter() < end:
+            app.processEvents()
+            a = win.analyzer
+            if a is not None and a.spectro is not None and a.spectro.count > 20 \
+                    and win.spectro.image.image is not None:
+                break
+            time.sleep(0.02)
+        a = win.analyzer
+        frames = a.spectro.count if a is not None and a.spectro is not None else 0
+        result("live analysis", ok and frames > 20, f"{frames} spectrogram frames")
+        win.stop()
+        win.close()
+    except Exception as exc:
+        result("live analysis", False, f"{type(exc).__name__}: {exc}")
+    lines.append("SMOKE TEST " + ("FAILED" if failed else "OK"))
+    text = "\n".join(lines) + "\n"
+    if report == "-":
+        print(text, end="")
+    else:
+        Path(report).write_text(text, encoding="utf-8")
+    return 1 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.smoke_test:
+        for name in ("stdout", "stderr"):
+            if getattr(sys, name) is None:
+                setattr(sys, name, open(os.devnull, "w"))
+        return smoke_test(args.smoke_test)
     ini = Path(args.settings) if args.settings else settings_path()
     setup_logging(ini.with_suffix(".log"))
     _install_excepthook()
@@ -151,6 +246,9 @@ def main(argv: list[str] | None = None) -> int:
 
     win = MainWindow(QSettings(str(ini), QSettings.IniFormat), ini.parent / f"{APP_NAME}Data")
     try:
+        if args.recordings:
+            win.select_source("audiofile")
+            win.file_panel.set_path(";".join(str(Path(p).resolve()) for p in args.recordings))
         if args.source:
             win.select_source(args.source)
         for item in args.set:

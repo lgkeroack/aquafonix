@@ -41,6 +41,7 @@ class Source:
         self.samples_received = 0
         self._listeners: list[Listener] = []
         self._listeners_lock = threading.Lock()
+        self._frame_listeners: list = []  # for sources that produce spectrogram frames
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._t0 = time.perf_counter()
@@ -127,6 +128,21 @@ class Source:
                 fn(x, y, names)
             except Exception:
                 log.exception("listener failed")
+
+    def add_frame_listener(self, fn) -> None:
+        """``fn(times, freqs, frames_db, reset)`` for sources that deliver spectrogram
+        frames rather than samples (a spectrogram read off the screen)."""
+        self._frame_listeners.append(fn)
+
+    def push_frames(self, times: np.ndarray, freqs: np.ndarray, frames: np.ndarray,
+                    reset: bool = False) -> None:
+        """``reset`` tells listeners the frames are on a new scale (e.g. the
+        colour bar or region changed): start the noise floor afresh."""
+        for fn in list(self._frame_listeners):
+            try:
+                fn(times, freqs, frames, reset)
+            except Exception:
+                log.exception("frame listener failed")
 
     def arrival_times(self, n: int, max_spread: float = 0.25) -> np.ndarray:
         """Timestamps for ``n`` samples that arrived together, spread evenly

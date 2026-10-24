@@ -4,19 +4,23 @@ from __future__ import annotations
 
 import re
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
 import numpy as np
 
-from aquafonix.screen.extract import (FrameTraces, ScrollStitcher, TraceSettings,
+from aquafonix.screen.extract import (Calibration, FrameTraces, ScrollStitcher, TraceSettings,
                                       extract_traces, probe_value)
+from aquafonix.screen.specread import (ColourScale, canonical, decode_levels,
+                                       to_frequency_grid)
 from aquafonix.sources.base import Source
 
 OUTPUTS = {
     "trace": "Live trace (whole curve)",
     "history": "Value history (one value per frame)",
     "stitch": "Scrolling chart (stitch history)",
+    "spectrogram": "Spectrogram image (read colours as levels)",
 }
 
 
@@ -111,6 +115,13 @@ class ScreenSource(Source):
         self.probe_column = probe_column
         self.buffer_capacity = 200_000
         self.latest: Frame | None = None
+        self.colour_scale = ColourScale()
+        self.orientation = "right"
+        self.spec_freqs = np.zeros(0)
+        self.latest_levels: np.ndarray | None = None
+        self._spec_reset = True
+        self.spec_stitcher = ScrollStitcher(ambiguity_px=0.5, max_error_px=12.0)
+        self._spec_key = None
         self.frames = 0
         self.measured_fps = 0.0
         self.stitcher = ScrollStitcher()
@@ -144,6 +155,10 @@ class ScreenSource(Source):
         region, settings, output = self.region, self.settings, self.output
         image = self._grabber.grab(region)
         t = self.now()
+        if output == "spectrogram":
+            self._read_spectrogram(image, t, region, settings)
+            self._pace(started, region, "spectrogram")
+            return
         result = extract_traces(image, settings)
         self.latest = Frame(image, result, t, region)
         names = result.names
@@ -160,11 +175,46 @@ class ScreenSource(Source):
         elif names:
             values = [probe_value(tr.y, self.probe, self.probe_column) for tr in result.traces]
             self.push([t], [values], names)
+        self._pace(started, region, f"line found in {result.coverage:.0%} of columns")
+
+    def _pace(self, started: float, region: Region, what: str) -> None:
         self.frames += 1
         elapsed = time.perf_counter() - started
         period = 1.0 / max(self.fps, 0.1)
         rate = 1.0 / max(elapsed, period)
         self.measured_fps = rate if self.frames == 1 else 0.9 * self.measured_fps + 0.1 * rate
         self.status = (f"Watching {region.width}×{region.height} at {self.measured_fps:.1f} fps"
-                       f" · line found in {result.coverage:.0%} of columns")
+                       f" · {what}")
         self._stop.wait(max(0.0, period - elapsed))
+
+    def _read_spectrogram(self, image: np.ndarray, t: float, region: Region,
+                          settings: TraceSettings) -> None:
+        """Decode a scrolling spectrogram shown on screen into frames."""
+        levels = canonical(decode_levels(image, self.colour_scale), self.orientation)
+        rows, cols = levels.shape
+        h, w = image.shape[:2]
+        cal = settings.calibration or Calibration.for_size(w, h)
+        if self.orientation == "right":
+            row_freqs = cal.y_value(np.arange(rows) + 0.5)
+        else:  # frequency runs along the screen's x axis
+            row_freqs = cal.x_value(np.arange(w) + 0.5)[::-1]
+        key = (region, cal, self.colour_scale, self.orientation)
+        if key != self._spec_key:
+            self.spec_stitcher.reset()
+            self._spec_key = key
+            self._spec_reset = True
+        grid, frames = to_frequency_grid(levels, np.asarray(row_freqs, float), min(512, rows))
+        self.spec_freqs = grid
+        ref = levels[::max(1, rows // 64)]
+        times, new = self.spec_stitcher.update(ref, frames, t)
+        empty = FrameTraces(np.arange(w) + 0.5, cal.x_value(np.arange(w) + 0.5), [],
+                            (0, 0, 0))
+        self.latest = Frame(image, empty, t, region)
+        self.latest_levels = levels
+        if len(times):
+            self.push_frames(times, grid, new, reset=self._spec_reset)
+            self._spec_reset = False
+            with np.errstate(all="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)  # all-blank columns
+                lvl = 10 * np.log10(np.nanmean(10 ** (new / 10), axis=1))
+            self.push(times, lvl, ["level (dB)"])

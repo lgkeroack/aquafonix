@@ -32,7 +32,7 @@ class DetectionsPanel(QWidget):
     save_event = Signal(int)
     selected = Signal(int)
 
-    COLS = ["Time", "Detection", "Score", "Band", "SNR", "Status"]
+    COLS = ["Time", "Detection", "Score", "Band", "SNR", "Bearing", "Status"]
     FILTERS = {"all": "All", "suspected": "Suspected", "unidentified": "Unidentified",
                "reviewed": "Reviewed"}
 
@@ -99,7 +99,7 @@ class DetectionsPanel(QWidget):
     def update_detections(self, detections) -> None:
         follow = self.table.verticalScrollBar().value() >= self.table.verticalScrollBar().maximum() - 2
         for det in detections:
-            state = (det.status, det.label, round(det.score, 3), det.t0, det.t1)
+            state = (det.status, det.label, round(det.score, 3), det.t0, det.t1, det.bearing)
             if self._state.get(det.id) == state:
                 continue
             self._state[det.id] = state
@@ -113,13 +113,14 @@ class DetectionsPanel(QWidget):
             values = [_time_text(det.t0, det.wall_time), det.text,
                       f"{det.score:.2f}" if det.score else "",
                       band, f"{det.snr_db:.1f} dB" if det.snr_db == det.snr_db else "",
-                      det.status]
+                      f"{det.bearing:.0f}°" if det.bearing is not None and det.bearing == det.bearing
+                      else "", det.status]
             color = QColor(*STATUS_COLORS.get(det.status, (200, 200, 200)))
             for c, v in enumerate(values):
                 item = QTableWidgetItem(v)
                 if c == 0:
                     item.setData(Qt.UserRole, det.id)
-                if c in (1, 5):
+                if c in (1, 6):
                     item.setForeground(color)
                 self.table.setItem(row, c, item)
             self.table.setRowHidden(row, not self._passes(det.status))

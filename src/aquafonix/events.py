@@ -62,7 +62,8 @@ class EventStore:
     def add(self, x: np.ndarray, y: np.ndarray, names: list[str], sample_rate: float | None,
             kind: str = "capture", title: str = "", tags: list[str] | None = None,
             notes: str = "", source: str = "", wall_start: float | None = None,
-            detections: list[dict] | None = None) -> EventRecord:
+            detections: list[dict] | None = None,
+            extra_arrays: dict[str, dict] | None = None) -> EventRecord:
         if not len(x):
             raise ValueError("nothing to save: the history is empty for that time span")
         now = dt.datetime.now()
@@ -81,6 +82,8 @@ class EventStore:
             with open(folder / clip, "w", newline="", encoding="utf-8") as f:
                 f.write(",".join(["time_s", *names]) + "\n")
                 np.savetxt(f, np.column_stack([x, y]), delimiter=",", fmt="%.10g")
+        for name, arrays in (extra_arrays or {}).items():  # e.g. a screen spectrogram patch
+            np.savez_compressed(folder / name, **{k: np.asarray(v) for k, v in arrays.items()})
         rec = EventRecord(
             id=folder.name, created=now.isoformat(timespec="seconds"), kind=kind, title=title,
             tags=list(tags or []), notes=notes, source=source,

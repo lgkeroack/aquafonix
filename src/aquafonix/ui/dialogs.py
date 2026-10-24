@@ -40,25 +40,56 @@ def clip_spectrogram(clip: np.ndarray, rate: float, height: int = 160) -> pg.Plo
     return w
 
 
-class IdentifyDialog(QDialog):
-    """Name a snipped sound; it becomes (or extends) a signature."""
+def patch_spectrogram(patch: dict, height: int = 160) -> pg.PlotWidget:
+    """A small static view of a spectrogram patch read off the screen."""
+    w = pg.PlotWidget()
+    w.setMinimumHeight(height)
+    w.setLabel("left", "Hz")
+    w.setLabel("bottom", "s")
+    d = np.asarray(patch["db"], dtype=float).T
+    img = pg.ImageItem(axisOrder="row-major")
+    img.setLookupTable(lookup_table("inferno"))
+    finite = d[np.isfinite(d)]
+    hi = float(np.percentile(finite, 99.5)) if len(finite) else 1.0
+    img.setImage(np.nan_to_num(d, nan=hi - 60), autoLevels=False, levels=(hi - 60, hi))
+    f = patch["freqs"]
+    img.setRect(QRectF(0, float(f[0]), d.shape[1] * float(patch["frame_period"]),
+                       float(f[-1] - f[0])))
+    w.addItem(img)
+    return w
 
-    def __init__(self, parent, labels: list[str], clip: np.ndarray, rate: float,
+
+class IdentifyDialog(QDialog):
+    """Name a snipped sound; it becomes (or extends) a signature.  ``clip`` is
+    audio, or a spectrogram patch dict when the data came from the screen."""
+
+    def __init__(self, parent, labels: list[str], clip, rate: float | None,
                  f_lo: float, f_hi: float, suggested: str = "", play=None,
                  title: str = "Identify sound") -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumWidth(460)
         lay = QVBoxLayout(self)
-        self.preview = clip_spectrogram(clip, rate)
+        is_patch = isinstance(clip, dict)
+        if is_patch:
+            self.preview = patch_spectrogram(clip)
+            f_top = float(clip["freqs"][-1])
+            rate = 2 * f_top
+            info_text = (f"{len(clip['db'])} spectrogram frames "
+                         f"({len(clip['db']) * float(clip['frame_period']):.2f} s) read from "
+                         "the screen")
+            play = None
+        else:
+            self.preview = clip_spectrogram(clip, rate)
+            info_text = f"{len(clip) / rate:.2f} s at {rate:g} Hz"
         self.band_lines = []
-        if rate >= 2000:
+        if rate >= 2000 or is_patch:
             for f in (f_lo, f_hi):
                 line = pg.InfiniteLine(f, angle=0, pen=pg.mkPen("#3ae8ff", dash=[4, 3]))
                 self.preview.addItem(line)
                 self.band_lines.append(line)
         lay.addWidget(self.preview)
-        info = QLabel(f"{len(clip) / rate:.2f} s at {rate:g} Hz")
+        info = QLabel(info_text)
         info.setStyleSheet("color: gray;")
         lay.addWidget(info)
         f = QFormLayout()
@@ -85,6 +116,7 @@ class IdentifyDialog(QDialog):
         f.addRow("Frequency band", row)
         self.method = combo(METHODS, "auto")
         f.addRow("Match by", self.method)
+        self.method.setEnabled(not is_patch)
         self.save_event = QCheckBox("Also save the clip as a tagged event")
         self.save_event.setChecked(True)
         f.addRow(self.save_event)
