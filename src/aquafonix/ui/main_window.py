@@ -4,6 +4,7 @@ identify / confirm / correct loop, event capture, replay and recording."""
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import time
 from pathlib import Path
@@ -11,18 +12,24 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDockWidget, QFileDialog, QFormLayout,
-                               QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-                               QPushButton, QScrollArea, QSlider, QSplitter, QStackedWidget,
-                               QTabWidget, QToolBar, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget, QFileDialog,
+                               QFormLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
+                               QMainWindow, QMessageBox, QProgressDialog, QPushButton,
+                               QScrollArea, QSlider, QSplitter, QStackedWidget, QTabWidget,
+                               QToolBar, QVBoxLayout, QWidget)
 
 from aquafonix import APP_NAME, __version__
+from aquafonix import raven
 from aquafonix.acoustics.analyzer import Analyzer, Detection
 from aquafonix.acoustics.filters import denoise, filter_clip
 from aquafonix.acoustics.signatures import Matcher, SignatureLibrary, estimate_band
 from aquafonix.buffer import RingBuffer
 from aquafonix.dsp import find_trigger, minmax_decimate
+from aquafonix.alerts import Alert, AlertEngine, AlertRule
+from aquafonix.audiofile import OPEN_FILTER
 from aquafonix.events import EventStore
+from aquafonix.outputs import (OutputHub, OutputSettings, alert_message, detection_message,
+                               levels_message)
 from aquafonix.player import SPEEDS, Player
 from aquafonix.recorder import CsvRecorder, WavRecorder
 from aquafonix.screen.capture import Region, ScreenSource
@@ -31,6 +38,8 @@ from aquafonix.screen.overlay import RegionOutline, RegionSelector
 from aquafonix.sources import Source
 from aquafonix.sources.audiofile import AudioFileSource
 from aquafonix.ui.acoustics_panel import AcousticsPanel
+from aquafonix.ui.alerts_ui import (AlertsDialog, AlertsPanel, OutputsDialog, Toast,
+                                    alert_time_text, beep)
 from aquafonix.ui.detail import SelectionDetail
 from aquafonix.ui.dialogs import IdentifyDialog, SignatureManager, ask_label
 from aquafonix.ui.panels import PANELS, AudioFilePanel, ScreenPanel, SourcePanel
@@ -97,6 +106,12 @@ class MainWindow(QMainWindow):
         self._levels_key = None
         self._spectro_t = 0.0
         self._bands_t = 0.0
+        self.alert_engine = AlertEngine(self._load_rules())
+        self.outputs = OutputHub()
+        self._alert_det_id = 0  # detections up to this id were checked / published
+        self._report_seen = None
+        self._levels_t: float | None = None
+        self._pending_saves: list[tuple[float, float, Alert]] = []
         self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.resize(1440, 900)
         self.selector = RegionSelector(self)
@@ -107,6 +122,9 @@ class MainWindow(QMainWindow):
         self.acoustics.set_profile_store(self.settings)
         self.events_panel.set_store(self.store)
         self.events_panel.set_tag_suggestions(self.library.labels())
+        self.outputs.configure(self._load_output_settings())
+        self.toast = Toast(self)
+        self.toast.clicked.connect(lambda: self.review_tabs.setCurrentWidget(self.alerts_panel))
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._refresh)
         self.timer.start(33)
@@ -207,6 +225,10 @@ class MainWindow(QMainWindow):
         m.addAction(self._action("Open audio file…", self.open_audio_file, "Ctrl+O"))
         m.addAction(self._action("Open data folder", lambda: self._open_folder(self.data_dir)))
         m.addSeparator()
+        m.addAction(self._action("Export detections (Raven table)…", self.export_detections_raven))
+        m.addAction(self._action("Export saved events (Raven table)…", self.export_events_raven))
+        m.addAction(self._action("Import Raven selections into signatures…", self.import_raven))
+        m.addSeparator()
         m.addAction(self._action("Exit", self.close))
         self.view_menu = mb.addMenu("&View")
         m = mb.addMenu("&Tools")
@@ -215,6 +237,9 @@ class MainWindow(QMainWindow):
             m.addAction(act)
         m.addAction(self._action("Signatures…", self.manage_signatures))
         m.addAction(self._action("Batch analysis of recordings…", self.batch_analysis))
+        m.addSeparator()
+        m.addAction(self._action("Alerts…", self.edit_alerts))
+        m.addAction(self._action("Data outputs (JSON stream)…", self.edit_outputs))
         m = mb.addMenu("&Help")
         m.addAction(self._action("Keyboard shortcuts", lambda: QMessageBox.information(
             self, "Shortcuts", SHORTCUTS)))
@@ -480,6 +505,10 @@ class MainWindow(QMainWindow):
         self.review_tabs = QTabWidget()
         self.review_tabs.addTab(self.det_panel, "Detections")
         self.review_tabs.addTab(self.events_panel, "Saved events")
+        self.alerts_panel = AlertsPanel()
+        self.alerts_panel.show_detection.connect(self.show_detection)
+        self.alerts_panel.rules_btn.clicked.connect(self.edit_alerts)
+        self.review_tabs.addTab(self.alerts_panel, "Alerts")
         dock = QDockWidget("Detections && events", self)
         dock.setObjectName("review")
         dock.setWidget(self.review_tabs)
@@ -620,6 +649,11 @@ class MainWindow(QMainWindow):
                 self.file_panel.speed.currentData())))
         self.det_panel.clear()
         self._last_det_id = 0
+        self._alert_det_id = 0
+        self._report_seen = None
+        self._levels_t = None
+        self._pending_saves = []
+        self.alert_engine.reset()
         self._sel = None
         self.time_plot.clear_selection()
         self.spectro.clear_selection()
@@ -740,6 +774,7 @@ class MainWindow(QMainWindow):
                 self.bearing_view.set_record(t, a.btr_bearings, rows)
                 self.bearing_view.set_detections(a.all_detections()[-500:])
             self.acoustics.show_report(a.report, a.alarm)
+            self._check_report(a)
             self.alarm_label.setText("⚠ NOISE FLOOR ALARM" if a.alarm else "")
             self.alarm_label.setStyleSheet("color:#ff5050; font-weight:bold;" if a.alarm else "")
         src = self.source
@@ -1428,6 +1463,11 @@ class MainWindow(QMainWindow):
             return
         dets = a.all_detections()
         newest = dets[-1].id if dets else 0
+        if newest > self._alert_det_id:
+            for det in dets:
+                if det.id > self._alert_det_id:
+                    self._new_detection(det)
+            self._alert_det_id = newest
         now = time.perf_counter()
         if newest != self._last_det_id or now - self._det_table_t > 0.25:
             self._last_det_id = newest
@@ -1470,6 +1510,7 @@ class MainWindow(QMainWindow):
         sig.confirmed += 1
         self.library.update(sig)
         self.analyzer.update_detection(det, status="confirmed")
+        self._publish_update(det)
         if self.save_reviewed.isChecked():
             self._save_event(det.t0 - 0.5, det.t1 + 0.5, "detection", sig.label, [sig.label],
                              dets=[det], open_editor=False)
@@ -1498,6 +1539,7 @@ class MainWindow(QMainWindow):
         new_sig = self.library.find(new_label)
         self.analyzer.update_detection(det, status="corrected", label=new_label,
                                        sig_id=new_sig.id if new_sig else None)
+        self._publish_update(det)
         self.events_panel.set_tag_suggestions(self.library.labels())
         if self.save_reviewed.isChecked():
             self._save_event(det.t0 - 0.5, det.t1 + 0.5, "detection", new_label, [new_label],
@@ -1518,6 +1560,7 @@ class MainWindow(QMainWindow):
                 sig.rejected += 1
                 self.library.update(sig)
         self.analyzer.update_detection(det, status="rejected")
+        self._publish_update(det)
 
     def identify_detection(self, det_id: int) -> None:
         det = self._det(det_id)
@@ -1588,6 +1631,220 @@ class MainWindow(QMainWindow):
                                default_threshold=self.acoustics.match_thr.value())
         dlg.exec()
         self.events_panel.set_tag_suggestions(self.library.labels())
+
+    # ======================================================================
+    # alerts and data outputs
+    # ======================================================================
+    def _load_rules(self) -> list[AlertRule]:
+        try:
+            raw = json.loads(str(self.settings.value("alerts/rules", "[]")))
+            return [AlertRule.from_dict(d) for d in raw]
+        except (ValueError, TypeError):
+            log.warning("ignoring unreadable alert rules")
+            return []
+
+    def _load_output_settings(self) -> OutputSettings:
+        try:
+            return OutputSettings.from_dict(json.loads(str(self.settings.value("outputs/settings",
+                                                                               "{}"))))
+        except (ValueError, TypeError):
+            return OutputSettings()
+
+    def edit_alerts(self) -> None:
+        dlg = AlertsDialog(self, self.alert_engine.rules, self.library.labels())
+        if dlg.exec():
+            self.alert_engine.set_rules(dlg.rules)
+            self.settings.setValue("alerts/rules",
+                                   json.dumps([r.to_dict() for r in dlg.rules]))
+
+    def edit_outputs(self) -> None:
+        def test(settings: OutputSettings) -> None:
+            self.outputs.configure(settings)
+            self.outputs.publish({"type": "test", "message": f"{APP_NAME} output test"})
+
+        before = self.outputs.settings
+        dlg = OutputsDialog(self, before, self.outputs.status, test)
+        if dlg.exec():
+            settings = dlg.settings()
+            self.settings.setValue("outputs/settings", json.dumps(settings.to_dict()))
+        else:
+            settings = before
+        self.outputs.configure(settings)
+
+    def _new_detection(self, det: Detection) -> None:
+        """First sight of a detection: publish it and check the alert rules."""
+        wall = self._wall_clock(det.t0)
+        if self.outputs.wants("detection"):
+            self.outputs.publish(detection_message(det, wall, "new", self._source_desc()))
+        for alert in self.alert_engine.check_detection(det):
+            self._fire_alert(alert, det)
+
+    def _publish_update(self, det: Detection | None) -> None:
+        if det is not None and self.outputs.wants("detection"):
+            self.outputs.publish(detection_message(det, self._wall_clock(det.t0), "update",
+                                                   self._source_desc()))
+
+    def _check_report(self, a: Analyzer) -> None:
+        if a.report is not self._report_seen:
+            self._report_seen = a.report
+            last = self.buffer.last_x() if self.buffer is not None else None
+            if last is not None:
+                for alert in self.alert_engine.check_report(a.report, float(last)):
+                    self._fire_alert(alert)
+        if self.outputs.wants("levels") and a.intervals is not None and a.intervals.count:
+            if self._levels_t is None:
+                t, v = a.intervals.latest(1)
+            else:
+                t, v = a.intervals.range(self._levels_t + 1e-9, np.inf)
+            if len(t):
+                self._levels_t = float(t[-1])
+                tt, tol = a.tol_series.range(float(t[0]) - 1e-9, float(t[-1]) + 1e-9)
+                off = a.offset_db
+                for i, ti in enumerate(t):
+                    j = np.flatnonzero(np.isclose(tt, ti))
+                    bands = ({b.label: float(tol[j[0], k] + off)
+                              for k, b in enumerate(a.tol_bands)} if len(j) else {})
+                    self.outputs.publish(levels_message(
+                        float(ti), self._wall_clock(float(ti)), v[i] + off, a.units,
+                        a.settings.band and (a.settings.band.low, a.settings.band.high), bands,
+                        a.report.demon, self._source_desc()))
+        self._do_pending_saves()
+
+    def _fire_alert(self, alert: Alert, det: Detection | None = None) -> None:
+        rule = alert.rule
+        wall = self._wall_clock(alert.stream_t)
+        self.alerts_panel.add(alert, alert_time_text(alert, wall))
+        n = len(self.alerts_panel.alerts)
+        self.review_tabs.setTabText(self.review_tabs.indexOf(self.alerts_panel), f"Alerts ({n})")
+        self.statusBar().showMessage(f"🔔 {rule.name}: {alert.message}", 10_000)
+        if rule.sound and not self.alerts_panel.mute.isChecked():
+            beep()
+        if rule.popup:
+            self.toast.notify(rule.name, alert.message)
+        if self.outputs.wants("alert"):
+            self.outputs.publish(alert_message(alert, wall, self._source_desc()))
+        if rule.save_event:
+            if det is not None:
+                span = (det.t0 - 5.0, det.t1 + 5.0)
+            else:
+                span = (alert.stream_t - 15.0, alert.stream_t + 5.0)
+            self._pending_saves.append((*span, alert))
+
+    def _do_pending_saves(self) -> None:
+        """Alert clips are saved once their post-roll has been recorded."""
+        if not self._pending_saves or self.buffer is None:
+            return
+        last = self.buffer.last_x()
+        if last is None:
+            return
+        keep = []
+        for t0, t1, alert in self._pending_saves:
+            if last >= t1 or not self.running:
+                det = self._det(alert.detection_id) if alert.detection_id is not None else None
+                tags = [alert.rule.name] + ([det.label] if det is not None and det.label else [])
+                self._save_event(t0, min(t1, last), "alert", alert.message[:120], tags,
+                                 f"Alert '{alert.rule.name}': {alert.message}",
+                                 open_editor=False)
+            else:
+                keep.append((t0, t1, alert))
+        self._pending_saves = keep
+
+    # -- Raven selection tables ---------------------------------------------------------
+    def _raven_path(self, title: str, name: str) -> str | None:
+        path, _ = QFileDialog.getSaveFileName(self, title, str(Path(self._last_dir) / name),
+                                              "Raven selection table (*.txt);;All files (*)")
+        if path:
+            self._last_dir = str(Path(path).parent)
+        return path or None
+
+    def export_detections_raven(self) -> None:
+        dets = self.analyzer.all_detections() if self.analyzer is not None else []
+        if not dets:
+            QMessageBox.information(self, APP_NAME, "There are no detections to export yet.")
+            return
+        path = self._raven_path("Export detections", "detections.selections.txt")
+        if not path:
+            return
+        src = self.source
+        locate = None
+        if isinstance(src, AudioFileSource):
+            def locate(t: float):
+                seg = src.segment_at(t)
+                return Path(seg.path).name, t - seg.start / src.sample_rate
+        channel = max(0, int(self.acoustics.channel.currentData())) + 1
+        rows = raven.detection_rows(dets, channel, self._wall_clock, locate)
+        try:
+            raven.write_table(path, rows, raven.DETECTION_EXTRA)
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not write the table:\n{exc}")
+            return
+        self.statusBar().showMessage(f"Exported {len(rows)} detections to {path}", 8000)
+
+    def export_events_raven(self) -> None:
+        records = self.store.list()
+        if not records:
+            QMessageBox.information(self, APP_NAME, "There are no saved events yet.")
+            return
+        path = self._raven_path("Export saved events", "events.selections.txt")
+        if not path:
+            return
+        try:
+            raven.write_table(path, raven.event_rows(records, self.store), raven.EVENT_EXTRA)
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not write the table:\n{exc}")
+            return
+        self.statusBar().showMessage(f"Exported {len(records)} events to {path}", 8000)
+
+    def import_raven(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Raven selection table", self._last_dir,
+                                              "Raven selection table (*.txt);;All files (*)")
+        if not path:
+            return
+        self._last_dir = str(Path(path).parent)
+        try:
+            table = raven.read_table(path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, APP_NAME, f"Can't read the table:\n{exc}")
+            return
+        columns = table.label_columns()
+        if not columns:
+            QMessageBox.information(self, APP_NAME, "The table has no column with names "
+                                    "(such as Annotation or Species) to learn from.")
+            return
+        if len(columns) > 1:
+            col, ok = QInputDialog.getItem(self, "Raven import", "Which column names the "
+                                           "sounds?", columns, 0, False)
+            if not ok:
+                return
+            table.set_label_column(col)
+        audio = None
+        if any(raven.resolve_audio(s, table.path.parent, None)[0] is None
+               for s in table.selections if s.label):
+            audio, _ = QFileDialog.getOpenFileName(
+                self, "Sound file the selections refer to", str(table.path.parent),
+                OPEN_FILTER)
+            if not audio:
+                return
+        n = sum(1 for s in table.selections if s.label)
+        progress = QProgressDialog("Adding examples…", "Stop", 0, max(n, 1), self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(400)
+
+        def step(i: int, total: int) -> bool:
+            progress.setValue(i)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
+        res = raven.import_selections(table, self.library, Path(audio) if audio else None,
+                                      progress=step)
+        progress.setValue(max(n, 1))
+        self.events_panel.set_tag_suggestions(self.library.labels())
+        lines = [f"Added {res.added} example(s) to {len(res.labels)} signature(s)."]
+        lines += [f"  • {k}: {v}" for k, v in sorted(res.labels.items())[:20]]
+        if res.skipped:
+            lines.append(f"Skipped {res.skipped} selection(s) (no name or no sound).")
+        lines += res.problems[:8]
+        QMessageBox.information(self, APP_NAME, "\n".join(lines))
 
     # ======================================================================
     # reactions to controls
@@ -1734,8 +1991,6 @@ class MainWindow(QMainWindow):
 
     # -- file transport ------------------------------------------------------------
     def open_audio_file(self) -> None:
-        from aquafonix.audiofile import OPEN_FILTER
-
         path, _ = QFileDialog.getOpenFileName(self, "Open recording", self._last_dir, OPEN_FILTER)
         if not path:
             return
@@ -2006,6 +2261,7 @@ class MainWindow(QMainWindow):
         if self.rec_overview is not None:
             self.rec_overview.stop()
         self.outline.close()
+        self.outputs.close()
         if self.persist:
             self.save_settings()
         super().closeEvent(event)
