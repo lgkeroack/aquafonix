@@ -36,7 +36,7 @@ from aquafonix.ui.dialogs import IdentifyDialog, SignatureManager, ask_label
 from aquafonix.ui.panels import PANELS, AudioFilePanel, ScreenPanel, SourcePanel
 from aquafonix.acoustics.metrics import band_resolution_ok, percentiles_db
 from aquafonix.acoustics.longterm import RecordingOverview
-from aquafonix.ui.plots import (COLORMAPS, LevelsPlot, OverviewPlot, PreviewView,
+from aquafonix.ui.plots import (COLORMAPS, BearingView, LevelsPlot, OverviewPlot, PreviewView,
                                 RecordingOverviewView, SpectrogramView, SpectrumPlot, TimePlot,
                                 TolPlot, channel_color)
 from aquafonix.ui.review import DetectionsPanel, EventsPanel
@@ -341,6 +341,8 @@ class MainWindow(QMainWindow):
         f.addRow(self.levels_on)
         self.peak_on = named(QCheckBox("Include peak level (Lpk)"), "display.lpk")
         f.addRow(self.peak_on)
+        self.btr_on = named(QCheckBox("Show bearing-time display (array)"), "display.btr")
+        f.addRow(self.btr_on)
         self._spec_form = f
         dl.addWidget(box)
         dl.addStretch(1)
@@ -420,6 +422,7 @@ class MainWindow(QMainWindow):
         self.spectro.setXLink(self.time_plot)
         self.spec_plot = SpectrumPlot()
         self.tol_plot = TolPlot()
+        self.bearing_view = BearingView()
         self.levels_plot = LevelsPlot()
 
         # transport bar for replaying files
@@ -462,6 +465,7 @@ class MainWindow(QMainWindow):
         bottom = QSplitter(Qt.Horizontal)
         bottom.addWidget(self.spec_plot)
         bottom.addWidget(self.tol_plot)
+        bottom.addWidget(self.bearing_view)
         self.bottom_split = bottom
         for w in (self.preview, wave, self.spectro, bottom, self.levels_plot):
             self.plot_split.addWidget(w)
@@ -491,7 +495,7 @@ class MainWindow(QMainWindow):
             w.currentIndexChanged.connect(self._display_changed)
         for w in (self.y_auto, self.spectrum_on, self.fft_log, self.spectro_on, self.levels_on,
                   self.overview_on, self.spec_snr, self.db_auto, self.spec_log, self.tol_on,
-                  self.psd_pct, self.peak_on):
+                  self.psd_pct, self.peak_on, self.btr_on):
             w.toggled.connect(self._display_changed)
         for w in (self.y_min, self.y_max, self.window_s, self.window_n, self.db_range,
                   self.f_max, self.f_min_log):
@@ -499,7 +503,7 @@ class MainWindow(QMainWindow):
         self.db_auto.toggled.connect(self._db_auto_toggled)
         self.spectro.levels_dragged.connect(lambda *_: self.db_auto.setChecked(False))
         for plot in (self.time_plot, self.spectro, self.spec_plot, self.tol_plot,
-                     self.levels_plot):
+                     self.levels_plot, self.bearing_view):
             plot.scene().sigMouseMoved.connect(lambda pos, p=plot: self._hover(p, pos))
         self.pre_roll.valueChanged.connect(self._update_capture_text)
         self.trig_level.valueChanged.connect(self._trigger_level_edited)
@@ -731,6 +735,10 @@ class MainWindow(QMainWindow):
                     self._refresh_tol(a)
             if self.levels_plot.isVisible() and a.intervals is not None and a.intervals.count:
                 self._refresh_levels(a)
+            if self.bearing_view.isVisible() and a.btr is not None and a.btr.count > 1:
+                t, rows = a.btr.latest(a.btr.count)
+                self.bearing_view.set_record(t, a.btr_bearings, rows)
+                self.bearing_view.set_detections(a.all_detections()[-500:])
             self.acoustics.show_report(a.report, a.alarm)
             self.alarm_label.setText("⚠ NOISE FLOOR ALARM" if a.alarm else "")
             self.alarm_label.setStyleSheet("color:#ff5050; font-weight:bold;" if a.alarm else "")
@@ -1197,7 +1205,8 @@ class MainWindow(QMainWindow):
                               cal.enabled, band, self._wall_clock(float(snap.x[0])),
                               play=lambda y, r, t: self._play_clip(y, r, t),
                               identify=identify,
-                              save_event=lambda a, b: self._save_event(a, b, "selection"))
+                              save_event=lambda a, b: self._save_event(a, b, "selection"),
+                              array=self.acoustics.array())
         win.show()
 
     def identify_selection(self) -> None:
@@ -1610,7 +1619,9 @@ class MainWindow(QMainWindow):
         self.spec_plot.setVisible(self.spectrum_on.isChecked())
         self.spec_plot.setLogMode(x=self.fft_log.isChecked(), y=False)
         self.tol_plot.setVisible(self.tol_on.isChecked())
-        self.bottom_split.setVisible(self.spectrum_on.isChecked() or self.tol_on.isChecked())
+        self.bearing_view.setVisible(self.btr_on.isChecked())
+        self.bottom_split.setVisible(self.spectrum_on.isChecked() or self.tol_on.isChecked()
+                                     or self.btr_on.isChecked())
         self.f_min_log.setEnabled(self.spec_log.isChecked())
         self.levels_plot.setVisible(self.levels_on.isChecked())
         self.overview.setVisible(self.overview_on.isChecked())

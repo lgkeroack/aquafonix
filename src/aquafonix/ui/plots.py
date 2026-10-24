@@ -609,6 +609,55 @@ class RecordingOverviewView(pg.GraphicsLayoutWidget):
                 return
 
 
+class BearingView(pg.PlotWidget):
+    """Bearing-time record: correlation strength per look direction over
+    time (newest at the top), with detections marked at their bearings."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setLabel("bottom", "Bearing from array axis", units="°")
+        self.setLabel("left", "Time", units="s")
+        self.image = pg.ImageItem(axisOrder="row-major")
+        self.image.setLookupTable(lookup_table("ocean"))
+        self.addItem(self.image)
+        self.marks = pg.ScatterPlotItem(size=9, pen=pg.mkPen("#000000"))
+        self.marks.setZValue(5)
+        self.addItem(self.marks)
+        self.labels: list[pg.TextItem] = []
+        self.setXRange(0, 180, padding=0)
+
+    def set_record(self, times: np.ndarray, bearings: np.ndarray, rows: np.ndarray) -> None:
+        if len(times) < 2:
+            return
+        r = np.clip(rows, 0, None)
+        r = r / (r.max(axis=1, keepdims=True) + 1e-12)  # each instant on its own scale
+        step = bearings[1] - bearings[0]
+        self.image.setImage(r, autoLevels=False, levels=(0.2, 1.0))
+        dt = (times[-1] - times[0]) / max(len(times) - 1, 1)
+        self.image.setRect(QRectF(bearings[0] - step / 2, times[0] - dt / 2,
+                                  bearings[-1] - bearings[0] + step, times[-1] - times[0] + dt))
+        self.setYRange(times[0], times[-1], padding=0)
+
+    def set_detections(self, detections) -> None:
+        pts = [d for d in detections if d.bearing is not None and np.isfinite(d.bearing)]
+        brushes = [pg.mkBrush(*STATUS_COLORS.get(d.status, (200, 200, 200))) for d in pts]
+        self.marks.setData([d.bearing for d in pts], [(d.t0 + d.t1) / 2 for d in pts],
+                           brush=brushes)
+        for item in self.labels:
+            self.removeItem(item)
+        self.labels = []
+        for d in pts[-40:]:
+            if d.label:
+                t = pg.TextItem(d.label, color=STATUS_COLORS.get(d.status, (200, 200, 200)),
+                                anchor=(0, 0.5))
+                t.setPos(d.bearing + 2, (d.t0 + d.t1) / 2)
+                self.addItem(t)
+                self.labels.append(t)
+
+    def value_at(self, x: float, y: float) -> str | None:
+        return f"bearing {x:.1f}° · t {y:.2f} s" if 0 <= x <= 180 else None
+
+
 class PreviewView(pg.GraphicsLayoutWidget):
     """The captured region with the detected lines and calibration lines."""
 

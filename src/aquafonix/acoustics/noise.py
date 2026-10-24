@@ -94,6 +94,7 @@ class NoiseReport:
     third_octaves: dict[str, float] = field(default_factory=dict)
     sources: list[tuple[str, float, str]] = field(default_factory=list)
     units: str = "dBFS"
+    demon: object = None  # DemonResult of the recent signal, if computed
 
 
 def guess_sources(freqs: np.ndarray, ltsa_db: np.ndarray, tonals, kurtosis: float,

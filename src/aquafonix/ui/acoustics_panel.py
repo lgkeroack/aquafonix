@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, 
                                QVBoxLayout, QWidget)
 
 from aquafonix.acoustics.analyzer import AnalysisSettings, HydrophoneCalibration
+from aquafonix.acoustics.array import SEAWATER_SOUND_SPEED, ArrayGeometry
 from aquafonix.acoustics.filters import FILTER_TYPES, PRESETS, BandSpec
 from aquafonix.acoustics.metrics import third_octave_bands
 from aquafonix.acoustics.noise import NoiseReport
@@ -75,6 +76,13 @@ class BandPicker(QDialog):
     def selected(self) -> tuple[str, ...]:
         return tuple(self.list.item(i).data(Qt.UserRole) for i in range(self.list.count())
                      if self.list.item(i).checkState() == Qt.Checked)
+
+
+def _hint_label(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setStyleSheet("color: gray;")
+    return label
 
 
 def _group(title: str, parent_layout: QVBoxLayout) -> QFormLayout:
@@ -190,6 +198,45 @@ class AcousticsPanel(QWidget):
             f.addRow(w)
         self._band_form = f
 
+        f = _group("Hydrophone array (bearing)", lay)
+        self.array_on = named(QCheckBox("Estimate bearings from two channels"), "ac.array")
+        f.addRow(self.array_on)
+        arow = QHBoxLayout()
+        self.ch_a = named(spin(1, 32, 1), "ac.cha")
+        self.ch_b = named(spin(1, 32, 2), "ac.chb")
+        arow.addWidget(QLabel("A"))
+        arow.addWidget(self.ch_a)
+        arow.addWidget(QLabel("B"))
+        arow.addWidget(self.ch_b)
+        f.addRow("Hydrophones", arow)
+        self.spacing = named(spin(0.01, 10_000, 1.0, decimals=3, suffix=" m"), "ac.spacing")
+        f.addRow("Spacing", self.spacing)
+        self.sound_speed = named(spin(300, 2000, SEAWATER_SOUND_SPEED, decimals=1,
+                                      suffix=" m/s"), "ac.soundspeed")
+        f.addRow("Sound speed", self.sound_speed)
+        f.addRow(_hint_label("Bearings are measured from the line A→B: 0° = towards B, "
+                             "90° = broadside, 180° = towards A (two hydrophones can't tell "
+                             "left from right). The isolated band, if any, is used."))
+        self._array_rows = (self.ch_a, self.ch_b, self.spacing, self.sound_speed)
+
+        f = _group("Propeller modulation (DEMON)", lay)
+        self.demon_on = named(QCheckBox("Look for shaft and blade rates"), "ac.demon")
+        self.demon_on.setChecked(True)
+        f.addRow(self.demon_on)
+        self.demon_auto = named(QCheckBox("Automatic band (1–10 kHz)"), "ac.demonauto")
+        self.demon_auto.setChecked(True)
+        f.addRow(self.demon_auto)
+        drow = QHBoxLayout()
+        self.demon_lo = named(spin(1, 200_000, 1000, decimals=0, suffix=" Hz"), "ac.demonlo")
+        self.demon_hi = named(spin(2, 400_000, 10_000, decimals=0, suffix=" Hz"), "ac.demonhi")
+        drow.addWidget(self.demon_lo)
+        drow.addWidget(QLabel("–"))
+        drow.addWidget(self.demon_hi)
+        f.addRow("Band", drow)
+        f.addRow(_hint_label("Demodulates the cavitation noise in this band; the envelope "
+                             "spectrum shows lines at the shaft rate and its harmonics, the "
+                             "strongest usually being the blade rate."))
+
         f = _group("Noise floor", lay)
         self.rise = named(spin(1, 3600, 20, decimals=1, suffix=" s"), "ac.floorrise")
         self.rise.setToolTip("How slowly the floor follows rising noise (calls shouldn't lift it)")
@@ -237,8 +284,12 @@ class AcousticsPanel(QWidget):
         for w in (self.channel, self.nfft, self.band_kind, self.integration, self.psd_nfft):
             w.currentIndexChanged.connect(self._changed)
         for w in (self.cal_on, self.band_on, self.band_show, self.band_listen, self.band_detect,
-                  self.alarm_on, self.detect_on, self.match_on):
+                  self.alarm_on, self.detect_on, self.match_on, self.array_on, self.demon_on,
+                  self.demon_auto):
             w.toggled.connect(self._changed)
+        for w in (self.ch_a, self.ch_b, self.spacing, self.sound_speed, self.demon_lo,
+                  self.demon_hi):
+            w.valueChanged.connect(self._changed)
         for w in (self.sens, self.gain, self.vfs):
             w.valueChanged.connect(lambda *_: self.cal_source.setText("Entered by hand"))
         for w in (self.sens, self.gain, self.vfs, self.band_lo, self.band_hi, self.rise,
@@ -344,7 +395,19 @@ class AcousticsPanel(QWidget):
             match_threshold=self.match_thr.value(), floor_alarm=self.alarm_on.isChecked(),
             floor_alarm_db=self.alarm_level.value(), stats_window_s=self.stats_window.value(),
             integration_s=float(self.integration.currentData()),
-            psd_nfft=int(self.psd_nfft.currentData()), tol_bands=self.tol_bands())
+            psd_nfft=int(self.psd_nfft.currentData()), tol_bands=self.tol_bands(),
+            array=self.array(), demon=self.demon_on.isChecked(), demon_band=self.demon_band())
+
+    def demon_band(self) -> tuple[float, float] | None:
+        if self.demon_auto.isChecked():
+            return None
+        lo, hi = sorted((self.demon_lo.value(), self.demon_hi.value()))
+        return (lo, max(hi, lo * 1.5))
+
+    def array(self) -> ArrayGeometry:
+        return ArrayGeometry(self.array_on.isChecked(), self.ch_a.value() - 1,
+                             self.ch_b.value() - 1, self.spacing.value(),
+                             self.sound_speed.value())
 
     def tol_bands(self) -> tuple[str, ...]:
         return parse_bands(self.tol_text.text())
@@ -381,6 +444,9 @@ class AcousticsPanel(QWidget):
         if rep.tonals:
             lines.append("<b>Tonal lines</b> " + ", ".join(
                 f"{f:.1f} Hz (+{p:.0f})" for f, p in rep.tonals[:6]))
+        d = rep.demon
+        if d is not None and d.shaft_hz is not None:
+            lines.append(f"<b>Propeller (DEMON)</b> {d.describe()}")
         if rep.sources:
             lines.append("<b>Likely noise sources</b> <span style='color:gray'>(heuristic)</span>")
             for name, score, reason in rep.sources[:4]:
@@ -406,3 +472,8 @@ class AcousticsPanel(QWidget):
         for w in (self.band_kind, self.band_row):
             w.setEnabled(on)
         self.alarm_level.setEnabled(self.alarm_on.isChecked())
+        for w in self._array_rows:
+            w.setEnabled(self.array_on.isChecked())
+        self.demon_auto.setEnabled(self.demon_on.isChecked())
+        for w in (self.demon_lo, self.demon_hi):
+            w.setEnabled(self.demon_on.isChecked() and not self.demon_auto.isChecked())

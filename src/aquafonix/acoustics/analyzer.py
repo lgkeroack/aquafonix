@@ -22,6 +22,8 @@ from typing import Callable
 import numpy as np
 
 from aquafonix.acoustics import metrics, noise
+from aquafonix.acoustics.array import ArrayGeometry, bearing_from_delay, bearing_scan, tdoa
+from aquafonix.acoustics.demon import demon
 from aquafonix.acoustics.filters import BandSpec, StreamingFIR, design_fir
 from aquafonix.acoustics.signatures import DEFAULT_THRESHOLD, Matcher
 from aquafonix.acoustics.spectral import (FloorTracker, auto_nfft, blur_freq, power_frames,
@@ -73,6 +75,10 @@ class AnalysisSettings:
     integration_s: float = 1.0  # averaging time for SPL / PSD / third-octave levels
     psd_nfft: int = 0  # 0 = automatic (~1 Hz resolution, fits the integration time)
     tol_bands: tuple[str, ...] = ("63 Hz", "125 Hz", "2 kHz")  # bands plotted over time
+    array: ArrayGeometry = ArrayGeometry()  # two hydrophones -> bearings
+    btr_step_s: float = 0.25  # bearing-time record resolution
+    demon: bool = True  # look for propeller modulation (DEMON) in the noise report
+    demon_band: tuple[float, float] | None = None  # None = automatic
 
 
 @dataclass
@@ -91,6 +97,8 @@ class Detection:
     status: str = "unidentified"  # suspected | unidentified | confirmed | corrected | rejected
     wall_time: float | None = None
     saved_event: str | None = None
+    bearing: float | None = None  # degrees from the array axis
+    bearing_q: float = 0.0  # GCC-PHAT peak quality (higher = clearer)
 
     @property
     def text(self) -> str:
@@ -218,6 +226,8 @@ class Analyzer:
         self.tol_bands: list[metrics.Band] = []
         self.psd_freqs = np.zeros(0)
         self.psd_nfft = 0
+        self.btr: _Ring | None = None  # bearing-time record (time x look direction)
+        self.btr_bearings = np.arange(0.0, 181.0, 2.0)
         self.freqs = np.zeros(0)
         self.nfft = 0
         self.hop = 0
@@ -332,8 +342,12 @@ class Analyzer:
         self._recent_matches: list[Detection] = []
         self._raw_tail = np.zeros(0)
         self._report_t = 0.0
+        self._demon_t = 0.0
+        self._demon = None
         self._int_buf = np.zeros(0)
         self._int_t0: float | None = None
+        self._btr_buf = np.zeros((0, 2))
+        self._btr_t0: float | None = None
         self._configured_for = None
 
     def channel_signal(self, y: np.ndarray) -> np.ndarray:
@@ -383,7 +397,15 @@ class Analyzer:
         self._peaks = _PeakPicker()
         self._configure_filter()
         self._configure_intervals()
+        self._configure_btr()
         self._configured_for = (rate, s.nfft, s.band)
+
+    def _configure_btr(self) -> None:
+        s = self.settings
+        self.btr = (_Ring(int(self.history_s / s.btr_step_s) + 8, len(self.btr_bearings))
+                    if s.array.enabled and self.nominal_rate else None)
+        self._btr_buf = np.zeros((0, 2))
+        self._btr_t0 = None
 
     def _configure_intervals(self) -> None:
         s, rate = self.settings, self.rate
@@ -432,6 +454,10 @@ class Analyzer:
         if ((new.integration_s, new.psd_nfft, new.stats_window_s)
                 != (old.integration_s, old.psd_nfft, old.stats_window_s)):
             self._configure_intervals()
+        if (new.array, new.btr_step_s) != (old.array, old.btr_step_s):
+            self._configure_btr()
+        if (new.demon, new.demon_band) != (old.demon, old.demon_band):
+            self._demon_t = 0.0
 
     def _process(self) -> bool:
         if self._pending is not None:
@@ -470,6 +496,7 @@ class Analyzer:
         self._shape_step(sig, snap.x)
         self._spectral_step(sig, float(snap.x[0]))
         self._integrate_step(sig, float(snap.x[0]))
+        self._bearing_step(snap)
         now = time.perf_counter()
         if now - self._report_t > 1.0:
             self._report_t = now
@@ -624,6 +651,46 @@ class Analyzer:
             self.tol_series.append(np.array([t0]),
                                    metrics.band_levels(f, psd, self.tol_bands)[None, :])
             self.psd_series.append(np.array([t0]), to_db(psd)[None, :].astype(np.float32))
+
+    # -- bearings (two-hydrophone array) ------------------------------------------
+    def _pair(self, y: np.ndarray) -> np.ndarray | None:
+        geo = self.settings.array
+        if not geo.enabled or y.ndim != 2 or max(geo.ch_a, geo.ch_b) >= y.shape[1]:
+            return None
+        return np.nan_to_num(y[:, [geo.ch_a, geo.ch_b]].astype(np.float64))
+
+    def _bearing_band(self) -> tuple[float, float] | None:
+        return self._band_edges() if self.settings.band is not None else None
+
+    def _bearing_step(self, snap) -> None:
+        if self.btr is None:
+            return
+        pair = self._pair(snap.y)
+        if pair is None:
+            return
+        if self._btr_t0 is None:
+            self._btr_t0, self._btr_buf = float(snap.x[0]), pair
+        else:
+            self._btr_buf = np.concatenate([self._btr_buf, pair])
+        n = max(64, int(self.settings.btr_step_s * self.rate))
+        geo, band = self.settings.array, self._bearing_band()
+        while len(self._btr_buf) >= n:
+            block, self._btr_buf = self._btr_buf[:n], self._btr_buf[n:]
+            scan = bearing_scan(block[:, 0], block[:, 1], self.rate, geo, self.btr_bearings, band)
+            self.btr.append(np.array([self._btr_t0 + n / (2 * self.rate)]), scan[None, :])
+            self._btr_t0 += n / self.rate
+
+    def _detection_bearing(self, det: "Detection") -> None:
+        if self.external or not self.settings.array.enabled:
+            return
+        snap = self.buffer.range(det.t0, det.t1)
+        pair = self._pair(snap.y) if len(snap) else None
+        if pair is None or len(pair) < 64:
+            return
+        band = (det.f_lo, det.f_hi) if det.f_hi > det.f_lo else None
+        tau, q = tdoa(pair[:, 0], pair[:, 1], self.rate, self.settings.array.max_delay, band)
+        det.bearing = bearing_from_delay(tau, self.settings.array)
+        det.bearing_q = q
 
     def latest_psd(self) -> tuple[np.ndarray, np.ndarray] | None:
         """(freqs, PSD dB per Hz, uncalibrated) of the last interval."""
@@ -827,6 +894,7 @@ class Analyzer:
 
     # -- detections store ----------------------------------------------------------
     def _add_detection(self, det: Detection) -> None:
+        self._detection_bearing(det)
         clip = self._grab_clip(det.t0 - 0.25, det.t1 + 0.25)
         with self._det_lock:
             det.id = self._next_id
@@ -852,6 +920,31 @@ class Analyzer:
                 setattr(det, k, v)
 
     # -- noise report ----------------------------------------------------------------
+    DEMON_WINDOW_S = 10.0
+
+    def _demon_step(self, rep) -> None:
+        """Propeller modulation over the last ~10 s, refreshed every few
+        seconds (less often when it is slow, e.g. at high sample rates)."""
+        if not self.settings.demon or self.external or not self.rate:
+            self._demon = None
+            return
+        now = time.perf_counter()
+        if now >= self._demon_t:
+            snap = self.buffer.latest(int(self.rate * self.DEMON_WINDOW_S))
+            if len(snap) >= self.rate * 2:
+                started = time.perf_counter()
+                try:
+                    self._demon = demon(self.channel_signal(snap.y), self.rate,
+                                        self.settings.demon_band)
+                except Exception:
+                    log.exception("DEMON analysis failed")
+                    self._demon = None
+                self._demon_t = now + max(5.0, 20 * (time.perf_counter() - started))
+        rep.demon = self._demon
+        d = self._demon
+        if d is not None and d.blades:
+            rep.sources.insert(0, ("Vessel propeller (DEMON)", 0.9, d.describe()))
+
     def _make_report(self) -> None:
         s = self.settings
         off = self.offset_db
@@ -879,6 +972,7 @@ class Analyzer:
             rep.tonals = noise.tonal_lines(ltsa, self.freqs)
             rep.sources = noise.guess_sources(self.freqs, ltsa, rep.tonals, rep.kurtosis,
                                               2 * self._nyquist())
+        self._demon_step(rep)
         self.report = rep
         self.alarm = bool(s.floor_alarm and np.isfinite(rep.floor_db)
                           and rep.floor_db >= s.floor_alarm_db)

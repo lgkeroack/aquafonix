@@ -8,14 +8,17 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtWidgets import (QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-                               QPushButton, QSplitter, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView,
+                               QLabel, QPushButton, QSplitter, QTableWidget, QTableWidgetItem,
+                               QTabWidget, QVBoxLayout, QWidget)
 
 from aquafonix.acoustics import metrics
+from aquafonix.acoustics.array import ArrayGeometry, bearing_from_delay, tdoa
+from aquafonix.acoustics.demon import default_band, demon
 from aquafonix.ui.plots import SpectrumPlot, TolPlot, colormap
-from aquafonix.ui.widgets import combo
+from aquafonix.ui.widgets import combo, spin
 
+MOD_RANGE = {"25": "0–25 Hz", "50": "0–50 Hz", "100": "0–100 Hz", "200": "0–200 Hz"}
 NFFT = {"0": "Auto", "256": "256", "512": "512", "1024": "1024", "2048": "2048", "4096": "4096",
         "8192": "8192", "16384": "16384", "32768": "32768", "65536": "65536"}
 
@@ -28,12 +31,13 @@ class SelectionDetail(QWidget):
     def __init__(self, parent, x: np.ndarray, y: np.ndarray, names: list[str], rate: float,
                  offset_db: float, calibrated: bool, band: tuple[float, float] | None = None,
                  wall_start: float | None = None, play=None, identify=None,
-                 save_event=None) -> None:
+                 save_event=None, array: ArrayGeometry | None = None) -> None:
         super().__init__(parent, Qt.Window)
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.x, self.y, self.names, self.rate = x, y, names, float(rate)
         self.offset, self.calibrated, self.band = offset_db, calibrated, band
         self.wall_start = wall_start
+        self.array = array
         self._play, self._identify, self._save_event = play, identify, save_event
         u = "dB re 1 µPa" if calibrated else "dBFS"
         self.units = {"SPL": u, "Lpk": u, "Lpkpk": u,
@@ -90,7 +94,11 @@ class SelectionDetail(QWidget):
         self.tol = TolPlot()
         lower.addWidget(self.psd)
         lower.addWidget(self.tol)
-        for w, k in ((self.wave, 2), (self.spec, 3), (lower, 3)):
+        self.tabs = QTabWidget()
+        self.tabs.addTab(lower, "Spectrum && ⅓-octaves")
+        self.tabs.addTab(self._demon_tab(), "DEMON (propeller)")
+        self.tabs.currentChanged.connect(lambda *_: self._update_demon())
+        for w, k in ((self.wave, 2), (self.spec, 3), (self.tabs, 3)):
             plots.addWidget(w)
             plots.setStretchFactor(plots.count() - 1, k)
         split.addWidget(plots)
@@ -107,7 +115,85 @@ class SelectionDetail(QWidget):
         self.rows: list[tuple[str, str, str]] = []
         self.psd_data = None
         self.tol_data = None
+        self.demon_result = None
+        self._demon_key = None
         self.recompute()
+
+    def _demon_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        bar = QHBoxLayout()
+        lo, hi = default_band(self.rate)
+        self.demon_auto = QCheckBox("Auto band")
+        self.demon_auto.setChecked(True)
+        nyq = int(self.rate // 2)
+        self.demon_lo = spin(1, nyq, int(lo), decimals=0, suffix=" Hz")
+        self.demon_hi = spin(2, nyq, int(hi), decimals=0, suffix=" Hz")
+        self.demon_range = combo(MOD_RANGE, "100")
+        for widget, label in ((self.demon_auto, None), (self.demon_lo, "Band"),
+                              (self.demon_hi, "–"), (self.demon_range, "Modulation")):
+            if label:
+                bar.addWidget(QLabel(label))
+            bar.addWidget(widget)
+        self.demon_auto.toggled.connect(lambda on: (self.demon_lo.setEnabled(not on),
+                                                    self.demon_hi.setEnabled(not on)))
+        self.demon_lo.setEnabled(False)
+        self.demon_hi.setEnabled(False)
+        for sig in (self.demon_auto.toggled, self.demon_lo.editingFinished,
+                    self.demon_hi.editingFinished, self.demon_range.currentIndexChanged):
+            sig.connect(lambda *_: self._update_demon())
+        bar.addStretch(1)
+        lay.addLayout(bar)
+        self.demon_plot = pg.PlotWidget()
+        self.demon_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.demon_plot.setLabel("bottom", "Modulation frequency", units="Hz")
+        self.demon_plot.setLabel("left", "Envelope level", units="dB")
+        self.demon_curve = self.demon_plot.plot([], [], pen=pg.mkPen("#4cc9f0", width=1))
+        self._demon_marks: list = []
+        lay.addWidget(self.demon_plot, 1)
+        self.demon_label = QLabel("")
+        self.demon_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(self.demon_label)
+        return w
+
+    def _update_demon(self) -> None:
+        """Envelope spectrum of the selection; computed when its tab is shown."""
+        if self.tabs.currentIndex() != 1:
+            return
+        band = None if self.demon_auto.isChecked() else (self.demon_lo.value(),
+                                                         self.demon_hi.value())
+        max_mod = float(self.demon_range.currentData())
+        key = (self.channel.currentIndex(), band, max_mod)
+        if key == self._demon_key:
+            return
+        self._demon_key = key
+        sig = self.signal()
+        for item in self._demon_marks:
+            self.demon_plot.removeItem(item)
+        self._demon_marks = []
+        if len(sig) < self.rate * 1.0:
+            self.demon_result = None
+            self.demon_curve.setData([], [])
+            self.demon_label.setText("Select at least 1 s (ideally 10 s or more) for DEMON.")
+            return
+        res = demon(sig, self.rate, band, max_mod_hz=max_mod,
+                    resolution_hz=max(0.05, max_mod / 1000))
+        self.demon_result = res
+        self.demon_curve.setData(res.freqs, res.level_db)
+        if res.shaft_hz:
+            k = 1
+            while k * res.shaft_hz <= max_mod and k <= 40:
+                blade = res.blades is not None and k == res.blades
+                line = pg.InfiniteLine(k * res.shaft_hz, angle=90, pen=pg.mkPen(
+                    "#ffb000" if blade else "#80808080", width=2 if blade else 1,
+                    style=Qt.SolidLine if blade or k == 1 else Qt.DashLine))
+                self.demon_plot.addItem(line)
+                self._demon_marks.append(line)
+                k += 1
+        lines = ", ".join(f"{f:.2f} Hz (+{p:.0f} dB)" for f, p in res.lines[:6])
+        self.demon_label.setText(f"{res.describe()}   ·   band {res.band[0]:,.0f}–"
+                                 f"{res.band[1]:,.0f} Hz" + (f"   ·   lines: {lines}"
+                                                              if lines else ""))
 
     def signal(self) -> np.ndarray:
         ch = max(0, self.channel.currentIndex())
@@ -177,6 +263,7 @@ class SelectionDetail(QWidget):
                      ("−10 dB bandwidth", f"{desc['bw10_hz']:,.1f}  "
                       f"({desc['f_lo10_hz']:,.0f}–{desc['f_hi10_hz']:,.0f})", "Hz"),
                      ("RMS bandwidth", f"{desc['rms_bandwidth_hz']:,.1f}", "Hz")]
+        rows += self._bearing_rows()
         rows += [("Sample rate", f"{rate:g}", "Hz"),
                  ("PSD resolution", f"{rate / nfft:.3f}", f"Hz (FFT {nfft})"),
                  ("Levels", "calibrated" if self.calibrated else "uncalibrated (full scale)", "")]
@@ -185,6 +272,23 @@ class SelectionDetail(QWidget):
         for r, values in enumerate(rows):
             for c, v in enumerate(values):
                 self.table.setItem(r, c, QTableWidgetItem(v))
+        self._update_demon()
+
+    def _bearing_rows(self) -> list[tuple[str, str, str]]:
+        geo = self.array
+        if geo is None or not geo.enabled or self.y.ndim != 2:
+            return []
+        if max(geo.ch_a, geo.ch_b) >= self.y.shape[1]:
+            return []
+        a = np.nan_to_num(np.asarray(self.y[:, geo.ch_a], float))
+        b = np.nan_to_num(np.asarray(self.y[:, geo.ch_b], float))
+        tau, q = tdoa(a, b, self.rate, geo.max_delay, self.band)
+        bearing = bearing_from_delay(tau, geo)
+        if not np.isfinite(bearing):
+            return []
+        return [("Bearing (from A→B axis)", f"{bearing:.1f}", "°"),
+                ("Time difference A−B", f"{tau * 1e3:.3f}", "ms"),
+                ("Bearing quality", f"{q:.1f}", "(peak / median)")]
 
     # -- actions -------------------------------------------------------------------
     def _clip(self):
@@ -226,6 +330,11 @@ class SelectionDetail(QWidget):
                 f.write("band,centre_hz,low_hz,high_hz,level_db,resolved\n")
                 for b, v, ok in zip(bands, tol, resolved):
                     f.write(f"{b.label},{b.centre:.3f},{b.low:.3f},{b.high:.3f},{v:.3f},{ok}\n")
+        if self.demon_result is not None:
+            res = self.demon_result
+            np.savetxt(base.with_name(base.stem + "_demon.csv"),
+                       np.column_stack([res.freqs, res.level_db]), delimiter=",", fmt="%.6g",
+                       header=f"mod_freq_hz,envelope_db  # {res.describe()}", comments="")
 
     def save_image(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save image", "selection.png",
