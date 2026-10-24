@@ -2118,7 +2118,7 @@ class MainWindow(QMainWindow):
         cols = [r.x, *[t.y for t in r.traces], r.x_px, *[t.y_px for t in r.traces]]
         header = ["x", *r.names, "x_px", *[f"{n}_px" for n in r.names]]
         np.savetxt(path, np.column_stack(cols), delimiter=",", fmt="%.10g", comments="",
-                   header=",".join(header))
+                   header=",".join(header), encoding="utf-8")
 
     # ======================================================================
     # recording / export
@@ -2190,7 +2190,7 @@ class MainWindow(QMainWindow):
         path = self._ask_save("Save view", "view", "CSV (*.csv)")
         if path:
             np.savetxt(path, np.column_stack([x, y]), delimiter=",", fmt="%.10g", comments="",
-                       header=",".join(["x", *names]))
+                       header=",".join(["x", *names]), encoding="utf-8")
 
     def _save_image(self) -> None:
         path = self._ask_save("Save image", "aquafonix", "PNG image (*.png)")

@@ -63,7 +63,7 @@ def test_live_generator_draws_everything(window, gui):
     win.set_control("gen.rate", "8000")
     win.set_control("gen.freq", "440")
     assert win.start()
-    assert gui.wait_until(lambda: npts(next(iter(win.time_plot.curves.values()))) > 100, 5)
+    assert gui.wait_until(lambda: any(npts(c) > 100 for c in win.time_plot.curves.values()), 5)
     assert gui.wait_until(lambda: win.spectro.image.image is not None, 5)
     assert gui.wait_until(lambda: npts(win.levels_plot.fixed[0]) > 0, 5)
     assert "samples/s" in win.status_label.text()

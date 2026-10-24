@@ -322,7 +322,8 @@ class SelectionDetail(QWidget):
             cols = [fp, psd] + [pct[k] for k in (5, 50, 95) if k in pct]
             hdr = ["freq_hz", "psd_db"] + [f"p{k}_db" for k in (5, 50, 95) if k in pct]
             np.savetxt(base.with_name(base.stem + "_psd.csv"), np.column_stack(cols),
-                       delimiter=",", fmt="%.6g", header=",".join(hdr), comments="")
+                       delimiter=",", fmt="%.6g", header=",".join(hdr), comments="",
+                       encoding="utf-8")
         if self.tol_data is not None:
             bands, tol, resolved = self.tol_data
             with open(base.with_name(base.stem + "_third_octaves.csv"), "w",
@@ -334,7 +335,8 @@ class SelectionDetail(QWidget):
             res = self.demon_result
             np.savetxt(base.with_name(base.stem + "_demon.csv"),
                        np.column_stack([res.freqs, res.level_db]), delimiter=",", fmt="%.6g",
-                       header=f"mod_freq_hz,envelope_db  # {res.describe()}", comments="")
+                       header=f"mod_freq_hz,envelope_db  # {res.describe()}", comments="",
+                       encoding="utf-8")
 
     def save_image(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save image", "selection.png",

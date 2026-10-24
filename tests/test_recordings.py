@@ -101,11 +101,11 @@ def test_recording_overview(rec):
 def test_batch_report_uses_file_calibration(rec, tmp_path):
     out = tmp_path / "batch.csv"
     res = run_batch(BatchJob([str(p) for p in sorted(rec.glob("*.wav"))], str(out), 1.0))
-    rows = [r for r in csv.reader(open(out)) if r and not r[0].startswith("#")]
+    rows = [r for r in csv.reader(open(out, encoding="utf-8")) if r and not r[0].startswith("#")]
     assert res["intervals"] == 20 and len(rows) == 21
     first = dict(zip(rows[0], rows[1]))
     assert float(first["SPL"]) == pytest.approx(TONE_DB + 170.5 - 20, abs=0.3)
-    summary = list(csv.reader(open(res["summary"])))
+    summary = list(csv.reader(open(res["summary"], encoding="utf-8")))
     assert summary[0][:4] == ["file", "intervals", "duration_s", "SPL_L5"]
     assert len(summary) == 4  # two files + overall
 
